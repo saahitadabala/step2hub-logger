@@ -1,510 +1,154 @@
-# Step2Hub — Logger (Streamlit Cloud + Supabase with Safe Fallback)
-# ------------------------------------------------
-# This version adds **automatic fallback** to SQLite if Postgres fails and a **Health Check** page.
-# Goal: one simple website that always loads; we can add cloud DB later without breaking anything.
-#
-# Quick start (local dev):
-#   1) pip install -r requirements.txt
-#   2) streamlit run app.py  (uses local SQLite by default)
-#
-# On Streamlit Cloud:
-#   - Deploy the repo with `app.py` and `requirements.txt`
-#   - Optional: Add Postgres URL in "App Settings → Secrets" under [db].url to enable cloud DB
-
-import re
-import os
-from datetime import datetime
-from dateutil import tz
-from typing import List, Dict
-
-import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+import pandas as pd
+import sqlalchemy
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime
+import os
 
-# ------------------------------
-# Config & DB engine (with safe fallback)
-# ------------------------------
+# --- Database Setup ---
+DB_MODE = os.getenv("DB_MODE", "sqlite")  # default = SQLite
+if DB_MODE == "postgres":
+    DB_URL = os.getenv("DB_URL")  # full Supabase/Postgres URL
+else:
+    DB_URL = "sqlite:///questions.db"  # local SQLite fallback
 
-st.set_page_config(page_title="Step2Hub — Logger (Cloud)", layout="wide")
+engine = create_engine(DB_URL, echo=True)
+Base = declarative_base()
+SessionLocal = sessionmaker(bind=engine)
 
-# Prefer cloud Postgres from secrets; fallback to local SQLite
-DATABASE_URL = st.secrets.get("db", {}).get("url") if hasattr(st, "secrets") else None
-DB_MODE = "sqlite"
-DB_INFO = "SQLite (no cloud DB configured)"
-engine: Engine | None = None
-
-# Try Postgres first if a URL is provided; otherwise use SQLite automatically
-try:
-    if DATABASE_URL:
-        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-        # probe the connection early
-        with engine.begin() as _conn:
-            _conn.execute(text("select 1"))
-        DB_MODE = "postgres"
-        DB_INFO = "Postgres (cloud DB active)"
-    else:
-        raise RuntimeError("No DATABASE_URL; using SQLite fallback")
-except Exception as e:
-    SQLITE_PATH = os.environ.get("STEP2HUB_SQLITE", "step2hub.db")
-    engine = create_engine(f"sqlite:///{SQLITE_PATH}")
-    DB_MODE = "sqlite"
-    DB_INFO = f"SQLite fallback — reason: {e.__class__.__name__}"
-
-st.info(f"DB mode: {DB_INFO}")
-
-# ------------------------------
-# Schema management
-# ------------------------------
-
-CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS logs (
-    id SERIAL PRIMARY KEY,
-    created_at TIMESTAMPTZ,
-    source TEXT,
-    exam TEXT,
-    qnum TEXT,
-    raw_question TEXT,
-    choices TEXT,
-    your_answer TEXT,
-    correct_answer TEXT,
-    confidence INTEGER,
-    explanation_raw TEXT,
-    topics TEXT,
-    primary_topic TEXT,
-    secondary_topic TEXT,
-    question_type TEXT,
-    error_types TEXT,
-    missed_clues TEXT,
-    notes TEXT
-);
-""" if DB_MODE == "postgres" else """
-CREATE TABLE IF NOT EXISTS logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at TEXT,
-    source TEXT,
-    exam TEXT,
-    qnum TEXT,
-    raw_question TEXT,
-    choices TEXT,
-    your_answer TEXT,
-    correct_answer TEXT,
-    confidence INTEGER,
-    explanation_raw TEXT,
-    topics TEXT,
-    primary_topic TEXT,
-    secondary_topic TEXT,
-    question_type TEXT,
-    error_types TEXT,
-    missed_clues TEXT,
-    notes TEXT
-);
-"""
-
+# --- DB Model ---
+class QuestionLog(Base):
+    __tablename__ = "question_logs"
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    raw_question = Column(Text)
+    choices = Column(Text)
+    user_answer = Column(String(50))
+    correct_answer = Column(String(50))
+    explanation = Column(Text)
+    reasoning = Column(Text)
+    qtype = Column(String(50))
+    primary_topic = Column(String(50))
+    secondary_topic = Column(String(50))
 
 def init_db():
-    """Create table and ensure new columns exist in whichever backend is active."""
-    with engine.begin() as conn:
-        conn.execute(text(CREATE_TABLE_SQL))
-        # migrations for new columns
-        try:
-            if DB_MODE == "postgres":
-                conn.execute(text("ALTER TABLE logs ADD COLUMN IF NOT EXISTS primary_topic TEXT"))
-                conn.execute(text("ALTER TABLE logs ADD COLUMN IF NOT EXISTS secondary_topic TEXT"))
-            else:
-                try:
-                    conn.execute(text("ALTER TABLE logs ADD COLUMN primary_topic TEXT"))
-                except Exception:
-                    pass
-                try:
-                    conn.execute(text("ALTER TABLE logs ADD COLUMN secondary_topic TEXT"))
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    Base.metadata.create_all(engine)
 
-
-# ------------------------------
-# Lightweight auto classification
-# ------------------------------
-
-QUESTION_TYPE_MAP = {
-    "diagnosis": [r"most likely diagnosis", r"what is the diagnosis", r"etiology", r"cause of"],
-    "management": [r"next best step", r"initial management", r"most appropriate management", r"treatment", r"therapy"],
-    "workup": [r"next test", r"most appropriate test", r"diagnostic step", r"screening", r"evaluation"],
-    "interpretation": [r"interpret the (ecg|abg|cxr|labs)", r"most likely finding", r"what does this (lab|image) indicate"],
-    "mechanism": [r"mechanism", r"pathophysiology", r"pharmacodynamics", r"moa", r"mechanism of action"],
-}
-
-ERROR_TYPES = [
-    "Content gap", "Interpretation", "NBME language trap",
-    "Priority/sequence", "Risk/benefit", "Premature closure", "Math/units"
-]
-
-TOPIC_SEEDS = {
-    "Cardiology": ["stemi", "nstemi", "heart failure", "chf", "afib", "valve", "jvp", "murmur"],
-    "Pulmonology": ["asthma", "copd", "pneumonia", "pe", "pneumothorax", "pleural"],
-    "Nephrology": ["ckd", "aki", "hyperkalemia", "hyponatremia", "bicarb", "metabolic acidosis", "diuretic"],
-    "Endocrine": ["thyroid", "graves", "hashimoto", "dka", "hhs", "adrenal", "cortisol"],
-    "Gastroenterology": ["cirrhosis", "ulcer", "gi bleed", "ibs", "ibd", "pancreatitis", "bilirubin"],
-    "Infectious Dz": ["sepsis", "meningitis", "endocarditis", "mrsa", "pseudomonas", "hiv", "cdiff"],
-    "Heme/Onc": ["anemia", "leukemia", "lymphoma", "multiple myeloma", "platelet", "transfusion"],
-    "OBGYN": ["pregnan", "preeclampsia", "postpartum", "ectopic", "sti", "pid"],
-    "Pediatrics": ["child", "infant", "vaccin", "bronchiolitis", "rsv", "otitis"],
-    "Psych": ["depress", "mania", "bipolar", "schizo", "anxiety", "ocd", "ptsd"],
-    "Surgery/Acute": ["trauma", "appendicitis", "cholecystitis", "bowel obstruction", "peritonitis"],
-}
-
-
+# --- Simple AI Guessing Helpers ---
 def guess_question_type(text: str) -> str:
-    t = text.lower()
-    for qtype, pats in QUESTION_TYPE_MAP.items():
-        for pat in pats:
-            if re.search(pat, t):
-                return qtype
-    if re.search(r"next (best )?step|initial management|treatment", t):
-        return "management"
-    if re.search(r"diagnosis|etiology|cause", t):
-        return "diagnosis"
-    return "management"
-
-
-def classify_topics(text: str) -> Dict[str, List[str] | str | None]:
-    t = (text or "").lower()
-    scores = {k: 0 for k in TOPIC_SEEDS.keys()}
-    for topic, seeds in TOPIC_SEEDS.items():
-        for seed in seeds:
-            if re.search(seed, t):
-                scores[topic] += 1
-    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
-    primary = None
-    secondary = None
-    if ranked and ranked[0][1] > 0:
-        primary = ranked[0][0]
-        if len(ranked) > 1 and ranked[1][1] > 0 and ranked[1][1] >= max(1, int(0.5 * ranked[0][1])) and ranked[1][0] != primary:
-            secondary = ranked[1][0]
-    if not primary:
-        # sensible default
-        primary = "General IM"
-    return {"primary": primary, "secondary": secondary, "topics_list": [primary] + ([secondary] if secondary else [])}
-
-
-
-def suggest_error_types(your_answer: str, correct_answer: str, stem: str, explanation: str) -> List[str]:
-    ya = (your_answer or "").strip().lower()
-    ca = (correct_answer or "").strip().lower()
-    ex = (explanation or "").lower()
-    stxt = (stem or "").lower()
-    suggested = set()
-
-    if re.search(r"first[- ]line|initial (therapy|management)|standard of care", ex) and ya and ca and ya != ca:
-        suggested.update(["Content gap", "Priority/sequence"])
-    if re.search(r"ecg|ekg|cxr|ct|mri|abg|pft|spirom", stxt + " " + ex):
-        suggested.add("Interpretation")
-    if re.search(r"always|never|except|most|least", stxt):
-        suggested.add("NBME language trap")
-    if re.search(r"anion gap|osm(olarity|olality)|dose|units|rate|fractional excretion|clearance", ex):
-        suggested.add("Math/units")
-    if not suggested:
-        suggested.add("Content gap")
-    return sorted(suggested)
-
-
-# ------------------------------
-# DB helpers
-# ------------------------------
-
-def local_now_iso() -> str:
-    return datetime.now(tz.tzlocal()).isoformat(timespec="seconds")
-
-
-def insert_log(row: Dict):
-    with engine.begin() as conn:
-        if DB_MODE == "postgres":
-            sql = text(
-                """
-                INSERT INTO logs (
-                    created_at, source, exam, qnum, raw_question, choices,
-                    your_answer, correct_answer, confidence, explanation_raw,
-                    topics, primary_topic, secondary_topic, question_type, error_types, missed_clues, notes
-                ) VALUES (
-                    :created_at, :source, :exam, :qnum, :raw_question, :choices,
-                    :your_answer, :correct_answer, :confidence, :explanation_raw,
-                    :topics, :primary_topic, :secondary_topic, :question_type, :error_types, :missed_clues, :notes
-                )
-                """
-            )
-            conn.execute(sql, row)
-        else:
-            # SQLite accepts the same named params
-            sql = text(
-                """
-                INSERT INTO logs (
-                    created_at, source, exam, qnum, raw_question, choices,
-                    your_answer, correct_answer, confidence, explanation_raw,
-                    topics, primary_topic, secondary_topic, question_type, error_types, missed_clues, notes
-                ) VALUES (
-                    :created_at, :source, :exam, :qnum, :raw_question, :choices,
-                    :your_answer, :correct_answer, :confidence, :explanation_raw,
-                    :topics, :primary_topic, :secondary_topic, :question_type, :error_types, :missed_clues, :notes
-                )
-                """
-            )
-            conn.execute(sql, row)
-
-
-def fetch_logs() -> pd.DataFrame:
-    with engine.begin() as conn:
-        df = pd.read_sql(text("SELECT * FROM logs ORDER BY id DESC"), conn)
-    # Back-compat: derive primary/secondary if missing
-    if "primary_topic" not in df.columns:
-        df["primary_topic"] = df.get("topics", pd.Series([], dtype=str)).fillna("").apply(lambda s: s.split(",")[0].strip() if s else "General IM")
-    if "secondary_topic" not in df.columns:
-        df["secondary_topic"] = df.get("topics", pd.Series([], dtype=str)).fillna("").apply(lambda s: s.split(",")[1].strip() if ("," in s) else None)
-    return df
-
-
-# ------------------------------
-# Analytics
-# ------------------------------
-
-def compute_stats(df: pd.DataFrame) -> Dict:
-    stats: Dict = {}
-    if df.empty:
-        return stats
-    df = df.copy()
-    df["is_correct"] = (
-        df["your_answer"].fillna("").str.strip().str.lower()
-        == df["correct_answer"].fillna("").str.strip().str.lower()
-    )
-    stats["total"] = len(df)
-    stats["accuracy"] = float(df["is_correct"].mean()) if len(df) else 0.0
-
-    topic_perf = (
-        df.groupby("primary_topic").agg(n=("id","count"), acc=("is_correct","mean")).reset_index()
-        .sort_values(["n","acc"], ascending=[False, True])
-    )
-    stats["topic_perf"] = topic_perf
-
-    errs = df.copy()
-    errs["err_list"] = errs["error_types"].fillna("").apply(lambda x: [t.strip() for t in x.split(",") if t.strip()])
-    errs = errs.explode("err_list")
-    err_counts = errs["err_list"].value_counts(dropna=True).rename_axis("error_type").reset_index(name="count")
-    stats["err_counts"] = err_counts
-
-    last20 = df.head(20)
-    stats["recent_acc"] = float(last20["is_correct"].mean()) if len(last20) else None
-    return stats
-
-
-# ------------------------------
-# UI
-# ------------------------------
-
-init_db()
-
-st.title("🧠 Step2Hub — Logger (Cloud)")
-st.caption("Cloud hub with Postgres (Supabase) or local SQLite fallback. MVP v0.3 — now with Health Check.")
-
-page = st.sidebar.radio("Navigate", ["Log New Question", "Dashboard", "Review / Export", "Health Check"], index=0)
-
-if page == "Log New Question":
-    st.subheader("Log a question")
-    with st.form("log_form", clear_on_submit=False):
-        colA, colB, colC = st.columns([1,1,1])
-        with colA:
-            source = st.text_input("Source (e.g., NBME, UWorld)")
-        with colB:
-            exam = st.text_input("Exam/Block (e.g., NBME 27, UWorld Block 15)")
-        with colC:
-            qnum = st.text_input("Question # (optional)")
-
-        raw_question = st.text_area("Question stem (paste full text)", height=180)
-        choices = st.text_area("Choices (paste A–E)", height=120)
-
-        col1, col2, col3 = st.columns([1,1,1])
-        with col1:
-            your_answer = st.text_input("Your answer (letter or text)")
-        with col2:
-            correct_answer = st.text_input("Correct answer (letter or text)")
-        with col3:
-            confidence = st.slider("Confidence", 1, 5, 3)
-
-        explanation_raw = st.text_area("Official explanation (paste)", height=180)
-
-        with st.expander("Auto-suggested classifications (editable)", expanded=True):
-            suggested_qtype = guess_question_type((raw_question or "") + "
-" + (explanation_raw or ""))
-            topic_suggestion = classify_topics((raw_question or "") + "
-" + (explanation_raw or ""))
-            suggested_primary = topic_suggestion["primary"]
-            suggested_secondary = topic_suggestion["secondary"]
-            suggested_errors = suggest_error_types(your_answer, correct_answer, raw_question, explanation_raw)
-
-            question_type = st.selectbox(
-                "Question type",
-                options=["diagnosis", "management", "workup", "interpretation", "mechanism"],
-                index=["diagnosis","management","workup","interpretation","mechanism"].index(suggested_qtype)
-            )
-            primary_topic = st.selectbox("Primary topic", options=sorted(list(TOPIC_SEEDS.keys()) + ["General IM"]), index=(sorted(list(TOPIC_SEEDS.keys()) + ["General IM"]).index(suggested_primary) if suggested_primary in (list(TOPIC_SEEDS.keys()) + ["General IM"]) else 0))
-            secondary_topic = st.selectbox("Secondary topic (optional)", options=["(none)"] + sorted(list(TOPIC_SEEDS.keys())), index=((["(none)"] + sorted(list(TOPIC_SEEDS.keys()))).index(suggested_secondary) if suggested_secondary in TOPIC_SEEDS else 0))
-            error_types = st.multiselect("Error types", options=ERROR_TYPES, default=suggested_errors)
-
-            missed_clues = st.text_area("Missed/Key clues (optional)", placeholder="e.g., S3, JVP↑, pulmonary edema")
-            notes = st.text_area("Notes / Next action (optional)", placeholder="e.g., 3 cards on ADHF tx ladder; 5 mini-qs on diuretics")
-
-        submitted = st.form_submit_button("➕ Save log")
-
-        if submitted:
-            if not raw_question.strip():
-                st.error("Please paste the question stem.")
-            elif not (your_answer.strip() and correct_answer.strip()):
-                st.error("Enter both your answer and the correct answer.")
-            else:
-                row = {
-                    "created_at": datetime.utcnow().isoformat(timespec="seconds"),
-                    "source": (source or "").strip(),
-                    "exam": (exam or "").strip(),
-                    "qnum": (qnum or "").strip(),
-                    "raw_question": (raw_question or "").strip(),
-                    "choices": (choices or "").strip(),
-                    "your_answer": (your_answer or "").strip(),
-                    "correct_answer": (correct_answer or "").strip(),
-                    "confidence": int(confidence),
-                    "explanation_raw": (explanation_raw or "").strip(),
-                    "topics": ", ".join([t for t in [primary_topic, (secondary_topic if secondary_topic != "(none)" else None)] if t]),
-                    "primary_topic": primary_topic,
-                    "secondary_topic": (secondary_topic if secondary_topic != "(none)" else None),
-                    "question_type": question_type,
-                    "error_types": ", ".join(error_types),
-                    "missed_clues": (missed_clues or "").strip(),
-                    "notes": (notes or "").strip(),
-                }
-                try:
-                    insert_log(row)
-                    st.success("Saved! Add another or open Dashboard.")
-                except Exception as e:
-                    st.error(f"Save failed: {e}")
-
-elif page == "Dashboard":
-    st.subheader("Overview")
-    try:
-        df = fetch_logs()
-    except Exception as e:
-        st.error(f"Could not load logs: {e}")
-        df = pd.DataFrame()
-
-    if df.empty:
-        st.info("No logs yet. Add your first one in 'Log New Question'.")
+    """Naive keyword-based question type classifier."""
+    text = text.lower()
+    if "most likely diagnosis" in text or "what is the diagnosis" in text:
+        return "Diagnosis"
+    elif "next step" in text or "management" in text or "treatment" in text:
+        return "Management"
+    elif "mechanism" in text or "pathophysiology" in text:
+        return "Mechanism"
+    elif "risk factor" in text or "predisposes" in text:
+        return "Risk Factor"
     else:
-        stats = compute_stats(df)
-        col1, col2, col3 = st.columns([1,1,1])
-        with col1:
-            st.metric("Total logged", stats.get("total", 0))
-        with col2:
-            st.metric("Overall accuracy", f"{stats.get('accuracy', 0.0)*100:.1f}%")
-        with col3:
-            ra = stats.get("recent_acc")
-            st.metric("Last 20 accuracy", f"{ra*100:.1f}%" if ra is not None else "–")
+        return "Other"
 
-        st.markdown("---")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Top Topics (by Primary) — volume & accuracy**")
-            topic_perf = stats["topic_perf"]
-            st.dataframe(topic_perf.rename(columns={"primary_topic":"topic"}), use_container_width=True)
-            st.bar_chart(topic_perf.set_index("primary_topic")["n"], use_container_width=True)
-        with c2:
-            st.markdown("**Error Type Breakdown**")
-            err_counts = stats["err_counts"]
-            st.dataframe(err_counts, use_container_width=True)
-            st.bar_chart(err_counts.set_index("error_type")["count"], use_container_width=True)
-
-        st.markdown("---")
-        st.markdown("**Recent Entries**")
-        show_cols = ["created_at","source","exam","qnum","primary_topic","secondary_topic","question_type","your_answer","correct_answer"]
-        st.dataframe(df[show_cols].head(10), use_container_width=True)
-
-elif page == "Review / Export":
-    st.subheader("Search, filter, and export your logs")
-    try:
-        df = fetch_logs()
-    except Exception as e:
-        st.error(f"Could not load logs: {e}")
-        df = pd.DataFrame()
-
-    if df.empty:
-        st.info("No logs yet.")
+def guess_topics(text: str):
+    """Naive keyword-based topic guesser (primary + secondary)."""
+    text = text.lower()
+    if "heart" in text or "cardiac" in text or "chest pain" in text:
+        return "Cardiology", "Cardiac symptoms"
+    elif "liver" in text or "hepatitis" in text:
+        return "Gastroenterology", "Hepatology"
+    elif "kidney" in text or "creatinine" in text:
+        return "Nephrology", "Renal function"
+    elif "pregnant" in text or "obstetric" in text:
+        return "Obstetrics", "Pregnancy"
+    elif "depression" in text or "psychiatry" in text:
+        return "Psychiatry", "Mood disorders"
     else:
-        fcol1, fcol2, fcol3 = st.columns(3)
-        with fcol1:
-            srcs = ["(all)"] + sorted([s for s in df["source"].dropna().unique() if s])
-            f_source = st.selectbox("Source", srcs)
-        with fcol2:
-            exms = ["(all)"] + sorted([s for s in df["exam"].dropna().unique() if s])
-            f_exam = st.selectbox("Exam/Block", exms)
-        with fcol3:
-            ptops = ["(all)"] + sorted([t for t in df["primary_topic"].dropna().unique() if t])
-            f_ptopic = st.selectbox("Primary topic", ptops)
+        return "General", "Uncategorized"
 
-        mask = pd.Series([True]*len(df))
-        if f_source != "(all)":
-            mask &= (df["source"] == f_source)
-        if f_exam != "(all)":
-            mask &= (df["exam"] == f_exam)
-        if f_ptopic != "(all)":
-            mask &= (df["primary_topic"] == f_ptopic)
+# --- Streamlit App ---
+def main():
+    st.title("🧠 Step2Hub — Logger")
+    st.write("Log your NBME/Step2 questions and track weak points.")
 
-        view = df[mask].copy()
-        st.dataframe(view, use_container_width=True)
+    menu = ["Log Question", "Dashboard"]
+    choice = st.sidebar.selectbox("Menu", menu)
 
-        csv = view.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", csv, file_name="step2hub_logs.csv", mime="text/csv")
+    if choice == "Log Question":
+        log_question()
+    elif choice == "Dashboard":
+        show_dashboard()
 
-elif page == "Health Check":
-    st.subheader("Health Check & Diagnostics")
-    st.write("Use this page to sanity‑check connectivity and data write/read in your current DB mode.")
-    st.code(DB_INFO)
+def log_question():
+    st.header("Log a Question")
 
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("Create table (idempotent)"):
-            try:
-                init_db()
-                st.success("Table ensured.")
-            except Exception as e:
-                st.error(f"Init failed: {e}")
-        if st.button("Insert test row"):
-            try:
-                row = {
-                    "created_at": datetime.utcnow().isoformat(timespec="seconds"),
-                    "source": "HEALTHCHECK",
-                    "exam": "SELFTEST",
-                    "qnum": "-",
-                    "raw_question": "Ping",
-                    "choices": "",
-                    "your_answer": "-",
-                    "correct_answer": "-",
-                    "confidence": 3,
-                    "explanation_raw": "",
-                    "topics": "Diagnostics",
-                    "question_type": "management",
-                    "error_types": "",
-                    "missed_clues": "",
-                    "notes": "healthcheck",
-                    "primary_topic": "Diagnostics",
-                    "secondary_topic": None
-                }
-                insert_log(row)
-                st.success("Inserted test row.")
-            except Exception as e:
-                st.error(f"Insert failed: {e}")
-    with colB:
-        try:
-            df = fetch_logs()
-            st.write(f"Rows in table: {len(df)}")
-            st.dataframe(df.head(5), use_container_width=True)
-        except Exception as e:
-            st.error(f"Read failed: {e}")
+    raw_question = st.text_area("Paste the Question")
+    choices = st.text_area("Paste the Choices (optional)")
+    user_answer = st.text_input("Your Answer")
+    correct_answer = st.text_input("Correct Answer")
+    reasoning = st.text_area("Why you chose your answer / reasoning")
+    explanation = st.text_area("Paste NBME Explanation")
 
-# End of file
+    if st.button("Submit"):
+        # Auto guess type & topics
+        combined_text = (raw_question or "") + " " + (explanation or "")
+        suggested_qtype = guess_question_type(combined_text)
+        primary_topic, secondary_topic = guess_topics(combined_text)
+
+        new_log = QuestionLog(
+            raw_question=raw_question,
+            choices=choices,
+            user_answer=user_answer,
+            correct_answer=correct_answer,
+            reasoning=reasoning,
+            explanation=explanation,
+            qtype=suggested_qtype,
+            primary_topic=primary_topic,
+            secondary_topic=secondary_topic,
+        )
+
+        session = SessionLocal()
+        session.add(new_log)
+        session.commit()
+        session.close()
+
+        st.success("Question logged successfully!")
+        st.info(f"Auto-detected Type: **{suggested_qtype}**, Topics: **{primary_topic} → {secondary_topic}**")
+
+def show_dashboard():
+    st.header("📊 Dashboard")
+    session = SessionLocal()
+    data = session.query(QuestionLog).all()
+    session.close()
+
+    if not data:
+        st.write("No questions logged yet.")
+        return
+
+    df = pd.DataFrame([{
+        "Timestamp": q.timestamp,
+        "Type": q.qtype,
+        "Primary Topic": q.primary_topic,
+        "Secondary Topic": q.secondary_topic,
+        "Your Answer": q.user_answer,
+        "Correct": q.correct_answer,
+        "Reasoning": q.reasoning,
+    } for q in data])
+
+    st.dataframe(df)
+
+    # Summary counts
+    st.subheader("Summary")
+    type_counts = df["Type"].value_counts()
+    topic_counts = df["Primary Topic"].value_counts()
+
+    st.write("**By Question Type:**")
+    st.bar_chart(type_counts)
+
+    st.write("**By Primary Topic:**")
+    st.bar_chart(topic_counts)
+
+# --- Run ---
+if __name__ == "__main__":
+    init_db()
+    main()
