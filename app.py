@@ -1,58 +1,65 @@
-# Step2Hub — Logger (Cloud-easy MVP)
-# ----------------------------------
-# Easiest path: deploy to Streamlit Cloud without any database setup.
-# Data is stored in a local SQLite file (works on Cloud until you redeploy).
-# Optional: set a Supabase Postgres URL in secrets later to make data permanent.
+# Step2Hub — Logger (Streamlit Cloud + Supabase with Safe Fallback)
+# ------------------------------------------------
+# This version adds **automatic fallback** to SQLite if Postgres fails and a **Health Check** page.
+# Goal: one simple website that always loads; we can add cloud DB later without breaking anything.
 #
-# Local dev:
-#   pip install -r requirements.txt
-#   streamlit run app.py
+# Quick start (local dev):
+#   1) pip install -r requirements.txt
+#   2) streamlit run app.py  (uses local SQLite by default)
 #
-# Streamlit Cloud:
-#   - Push this folder to GitHub
-#   - Deploy the repo as a Streamlit app
-#   - (Optional) Set [db].url secret to Supabase URI for durable storage
+# On Streamlit Cloud:
+#   - Deploy the repo with `app.py` and `requirements.txt`
+#   - Optional: Add Postgres URL in "App Settings → Secrets" under [db].url to enable cloud DB
 
-import os, re
+import re
+import os
 from datetime import datetime
+from dateutil import tz
 from typing import List, Dict
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
-# --- Optional Postgres via secrets ---
+# ------------------------------
+# Config & DB engine (with safe fallback)
+# ------------------------------
+
+st.set_page_config(page_title="Step2Hub — Logger (Cloud)", layout="wide")
+
+# Prefer cloud Postgres from secrets; fallback to local SQLite
 DATABASE_URL = st.secrets.get("db", {}).get("url") if hasattr(st, "secrets") else None
+DB_MODE = "sqlite"
+DB_INFO = "SQLite (no cloud DB configured)"
+engine: Engine | None = None
 
-# Prefer SQLAlchemy only if DATABASE_URL is present (to keep requirements minimal)
-if DATABASE_URL:
-    from sqlalchemy import create_engine, text
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-    DB_MODE = "postgres"
-else:
-    import sqlite3
-    DB_PATH = os.environ.get("STEP2HUB_SQLITE", "step2hub.db")
+# Try Postgres first if a URL is provided; otherwise use SQLite automatically
+try:
+    if DATABASE_URL:
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        # probe the connection early
+        with engine.begin() as _conn:
+            _conn.execute(text("select 1"))
+        DB_MODE = "postgres"
+        DB_INFO = "Postgres (cloud DB active)"
+    else:
+        raise RuntimeError("No DATABASE_URL; using SQLite fallback")
+except Exception as e:
+    SQLITE_PATH = os.environ.get("STEP2HUB_SQLITE", "step2hub.db")
+    engine = create_engine(f"sqlite:///{SQLITE_PATH}")
     DB_MODE = "sqlite"
+    DB_INFO = f"SQLite fallback — reason: {e.__class__.__name__}"
 
+st.info(f"DB mode: {DB_INFO}")
 
-st.set_page_config(page_title="Step2Hub — Logger", layout="wide")
-st.info(f"DB mode: {'Postgres' if DATABASE_URL else 'SQLite (fallback)'}")
-if DATABASE_URL:
-    try:
-        from sqlalchemy import text as satxt
-        with engine.begin() as conn:
-            conn.execute(satxt("select 1"))
-        st.success("Postgres connection OK")
-    except Exception as e:
-        st.error(f"Postgres connection FAILED: {e}")
+# ------------------------------
+# Schema management
+# ------------------------------
 
-st.title("🧠 Step2Hub — Logger")
-st.caption("Cloud-easy MVP: SQLite by default, optional Supabase for permanent cloud storage.")
-
-# ------------- Schema / DB helpers -------------
-
-CREATE_TABLE_SQL_POSTGRES = """
+CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS logs (
-    id BIGSERIAL PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ,
     source TEXT,
     exam TEXT,
@@ -69,9 +76,7 @@ CREATE TABLE IF NOT EXISTS logs (
     missed_clues TEXT,
     notes TEXT
 );
-"""
-
-CREATE_TABLE_SQLITE = """
+""" if DB_MODE == "postgres" else """
 CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT,
@@ -92,62 +97,16 @@ CREATE TABLE IF NOT EXISTS logs (
 );
 """
 
+
 def init_db():
-    if DB_MODE == "postgres":
-        from sqlalchemy import text as satxt
-        with engine.begin() as conn:
-            conn.execute(satxt(CREATE_TABLE_SQL_POSTGRES))
-    else:
-        con = sqlite3.connect(DB_PATH)
-        con.execute(CREATE_TABLE_SQLITE)
-        con.commit()
-        con.close()
+    """Create table in whichever backend is active."""
+    with engine.begin() as conn:
+        conn.execute(text(CREATE_TABLE_SQL))
 
-def insert_log(row: Dict):
-    if DB_MODE == "postgres":
-        from sqlalchemy import text as satxt
-        sql = satxt("""
-            INSERT INTO logs (
-                created_at, source, exam, qnum, raw_question, choices,
-                your_answer, correct_answer, confidence, explanation_raw,
-                topics, question_type, error_types, missed_clues, notes
-            ) VALUES (
-                :created_at, :source, :exam, :qnum, :raw_question, :choices,
-                :your_answer, :correct_answer, :confidence, :explanation_raw,
-                :topics, :question_type, :error_types, :missed_clues, :notes
-            )
-        """)
-        with engine.begin() as conn:
-            conn.execute(sql, row)
-    else:
-        con = sqlite3.connect(DB_PATH)
-        con.execute("""
-            INSERT INTO logs (
-                created_at, source, exam, qnum, raw_question, choices,
-                your_answer, correct_answer, confidence, explanation_raw,
-                topics, question_type, error_types, missed_clues, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            row["created_at"], row["source"], row["exam"], row["qnum"],
-            row["raw_question"], row["choices"], row["your_answer"], row["correct_answer"],
-            row["confidence"], row["explanation_raw"], row["topics"], row["question_type"],
-            row["error_types"], row["missed_clues"], row["notes"]
-        ))
-        con.commit()
-        con.close()
 
-def fetch_logs() -> pd.DataFrame:
-    if DB_MODE == "postgres":
-        from sqlalchemy import text as satxt
-        with engine.begin() as conn:
-            return pd.read_sql(satxt("SELECT * FROM logs ORDER BY id DESC"), conn)
-    else:
-        con = sqlite3.connect(DB_PATH)
-        df = pd.read_sql("SELECT * FROM logs ORDER BY id DESC", con)
-        con.close()
-        return df
-
-# ------------- Auto classification (lite) -------------
+# ------------------------------
+# Lightweight auto classification
+# ------------------------------
 
 QUESTION_TYPE_MAP = {
     "diagnosis": [r"most likely diagnosis", r"what is the diagnosis", r"etiology", r"cause of"],
@@ -176,8 +135,9 @@ TOPIC_SEEDS = {
     "Surgery/Acute": ["trauma", "appendicitis", "cholecystitis", "bowel obstruction", "peritonitis"],
 }
 
+
 def guess_question_type(text: str) -> str:
-    t = (text or "").lower()
+    t = text.lower()
     for qtype, pats in QUESTION_TYPE_MAP.items():
         for pat in pats:
             if re.search(pat, t):
@@ -188,13 +148,15 @@ def guess_question_type(text: str) -> str:
         return "diagnosis"
     return "management"
 
+
 def guess_topics(text: str) -> List[str]:
-    t = (text or "").lower()
+    t = text.lower()
     hits = []
     for topic, seeds in TOPIC_SEEDS.items():
         if any(re.search(seed, t) for seed in seeds):
             hits.append(topic)
     return hits or ["General IM"]
+
 
 def suggest_error_types(your_answer: str, correct_answer: str, stem: str, explanation: str) -> List[str]:
     ya = (your_answer or "").strip().lower()
@@ -202,6 +164,7 @@ def suggest_error_types(your_answer: str, correct_answer: str, stem: str, explan
     ex = (explanation or "").lower()
     stxt = (stem or "").lower()
     suggested = set()
+
     if re.search(r"first[- ]line|initial (therapy|management)|standard of care", ex) and ya and ca and ya != ca:
         suggested.update(["Content gap", "Priority/sequence"])
     if re.search(r"ecg|ekg|cxr|ct|mri|abg|pft|spirom", stxt + " " + ex):
@@ -214,7 +177,59 @@ def suggest_error_types(your_answer: str, correct_answer: str, stem: str, explan
         suggested.add("Content gap")
     return sorted(suggested)
 
-# ------------- Analytics -------------
+
+# ------------------------------
+# DB helpers
+# ------------------------------
+
+def local_now_iso() -> str:
+    return datetime.now(tz.tzlocal()).isoformat(timespec="seconds")
+
+
+def insert_log(row: Dict):
+    with engine.begin() as conn:
+        if DB_MODE == "postgres":
+            sql = text(
+                """
+                INSERT INTO logs (
+                    created_at, source, exam, qnum, raw_question, choices,
+                    your_answer, correct_answer, confidence, explanation_raw,
+                    topics, question_type, error_types, missed_clues, notes
+                ) VALUES (
+                    :created_at, :source, :exam, :qnum, :raw_question, :choices,
+                    :your_answer, :correct_answer, :confidence, :explanation_raw,
+                    :topics, :question_type, :error_types, :missed_clues, :notes
+                )
+                """
+            )
+            conn.execute(sql, row)
+        else:
+            # SQLite accepts the same named params
+            sql = text(
+                """
+                INSERT INTO logs (
+                    created_at, source, exam, qnum, raw_question, choices,
+                    your_answer, correct_answer, confidence, explanation_raw,
+                    topics, question_type, error_types, missed_clues, notes
+                ) VALUES (
+                    :created_at, :source, :exam, :qnum, :raw_question, :choices,
+                    :your_answer, :correct_answer, :confidence, :explanation_raw,
+                    :topics, :question_type, :error_types, :missed_clues, :notes
+                )
+                """
+            )
+            conn.execute(sql, row)
+
+
+def fetch_logs() -> pd.DataFrame:
+    with engine.begin() as conn:
+        df = pd.read_sql(text("SELECT * FROM logs ORDER BY id DESC"), conn)
+    return df
+
+
+# ------------------------------
+# Analytics
+# ------------------------------
 
 def compute_stats(df: pd.DataFrame) -> Dict:
     stats: Dict = {}
@@ -247,11 +262,17 @@ def compute_stats(df: pd.DataFrame) -> Dict:
     stats["recent_acc"] = float(last20["is_correct"].mean()) if len(last20) else None
     return stats
 
-# ------------- UI -------------
+
+# ------------------------------
+# UI
+# ------------------------------
 
 init_db()
 
-page = st.sidebar.radio("Navigate", ["Log New Question", "Dashboard", "Review / Export"], index=0)
+st.title("🧠 Step2Hub — Logger (Cloud)")
+st.caption("Cloud hub with Postgres (Supabase) or local SQLite fallback. MVP v0.3 — now with Health Check.")
+
+page = st.sidebar.radio("Navigate", ["Log New Question", "Dashboard", "Review / Export", "Health Check"], index=0)
 
 if page == "Log New Question":
     st.subheader("Log a question")
@@ -278,8 +299,10 @@ if page == "Log New Question":
         explanation_raw = st.text_area("Official explanation (paste)", height=180)
 
         with st.expander("Auto-suggested classifications (editable)", expanded=True):
-            suggested_qtype = guess_question_type((raw_question or "") + "\n" + (explanation_raw or ""))
-            suggested_topics = guess_topics((raw_question or "") + "\n" + (explanation_raw or ""))
+            suggested_qtype = guess_question_type((raw_question or "") + "
+" + (explanation_raw or ""))
+            suggested_topics = guess_topics((raw_question or "") + "
+" + (explanation_raw or ""))
             suggested_errors = suggest_error_types(your_answer, correct_answer, raw_question, explanation_raw)
 
             question_type = st.selectbox(
@@ -296,9 +319,9 @@ if page == "Log New Question":
         submitted = st.form_submit_button("➕ Save log")
 
         if submitted:
-            if not (raw_question or "").strip():
+            if not raw_question.strip():
                 st.error("Please paste the question stem.")
-            elif not ((your_answer or "").strip() and (correct_answer or "").strip()):
+            elif not (your_answer.strip() and correct_answer.strip()):
                 st.error("Enter both your answer and the correct answer.")
             else:
                 row = {
@@ -351,14 +374,12 @@ elif page == "Dashboard":
             st.markdown("**Top Topics (volume & accuracy)**")
             topic_perf = stats["topic_perf"]
             st.dataframe(topic_perf, use_container_width=True)
-            if not topic_perf.empty:
-                st.bar_chart(topic_perf.set_index("topics_list")["n"], use_container_width=True)
+            st.bar_chart(topic_perf.set_index("topics_list")["n"], use_container_width=True)
         with c2:
             st.markdown("**Error Type Breakdown**")
             err_counts = stats["err_counts"]
             st.dataframe(err_counts, use_container_width=True)
-            if not err_counts.empty:
-                st.bar_chart(err_counts.set_index("error_type")["count"], use_container_width=True)
+            st.bar_chart(err_counts.set_index("error_type")["count"], use_container_width=True)
 
         st.markdown("---")
         st.markdown("**Recent Entries**")
@@ -387,8 +408,7 @@ elif page == "Review / Export":
             qtypes = ["(all)"] + sorted([q for q in df["question_type"].dropna().unique() if q])
             f_qtype = st.selectbox("Question type", qtypes)
 
-        import numpy as np
-        mask = pd.Series(np.ones(len(df), dtype=bool))
+        mask = pd.Series([True]*len(df))
         if f_source != "(all)":
             mask &= (df["source"] == f_source)
         if f_exam != "(all)":
@@ -401,3 +421,49 @@ elif page == "Review / Export":
 
         csv = view.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", csv, file_name="step2hub_logs.csv", mime="text/csv")
+
+elif page == "Health Check":
+    st.subheader("Health Check & Diagnostics")
+    st.write("Use this page to sanity‑check connectivity and data write/read in your current DB mode.")
+    st.code(DB_INFO)
+
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Create table (idempotent)"):
+            try:
+                init_db()
+                st.success("Table ensured.")
+            except Exception as e:
+                st.error(f"Init failed: {e}")
+        if st.button("Insert test row"):
+            try:
+                row = {
+                    "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    "source": "HEALTHCHECK",
+                    "exam": "SELFTEST",
+                    "qnum": "-",
+                    "raw_question": "Ping",
+                    "choices": "",
+                    "your_answer": "-",
+                    "correct_answer": "-",
+                    "confidence": 3,
+                    "explanation_raw": "",
+                    "topics": "Diagnostics",
+                    "question_type": "management",
+                    "error_types": "",
+                    "missed_clues": "",
+                    "notes": "healthcheck"
+                }
+                insert_log(row)
+                st.success("Inserted test row.")
+            except Exception as e:
+                st.error(f"Insert failed: {e}")
+    with colB:
+        try:
+            df = fetch_logs()
+            st.write(f"Rows in table: {len(df)}")
+            st.dataframe(df.head(5), use_container_width=True)
+        except Exception as e:
+            st.error(f"Read failed: {e}")
+
+# End of file
