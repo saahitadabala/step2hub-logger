@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS logs (
     confidence INTEGER,
     explanation_raw TEXT,
     topics TEXT,
+    primary_topic TEXT,
+    secondary_topic TEXT,
     question_type TEXT,
     error_types TEXT,
     missed_clues TEXT,
@@ -90,6 +92,8 @@ CREATE TABLE IF NOT EXISTS logs (
     confidence INTEGER,
     explanation_raw TEXT,
     topics TEXT,
+    primary_topic TEXT,
+    secondary_topic TEXT,
     question_type TEXT,
     error_types TEXT,
     missed_clues TEXT,
@@ -99,9 +103,25 @@ CREATE TABLE IF NOT EXISTS logs (
 
 
 def init_db():
-    """Create table in whichever backend is active."""
+    """Create table and ensure new columns exist in whichever backend is active."""
     with engine.begin() as conn:
         conn.execute(text(CREATE_TABLE_SQL))
+        # migrations for new columns
+        try:
+            if DB_MODE == "postgres":
+                conn.execute(text("ALTER TABLE logs ADD COLUMN IF NOT EXISTS primary_topic TEXT"))
+                conn.execute(text("ALTER TABLE logs ADD COLUMN IF NOT EXISTS secondary_topic TEXT"))
+            else:
+                try:
+                    conn.execute(text("ALTER TABLE logs ADD COLUMN primary_topic TEXT"))
+                except Exception:
+                    pass
+                try:
+                    conn.execute(text("ALTER TABLE logs ADD COLUMN secondary_topic TEXT"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 # ------------------------------
@@ -149,13 +169,25 @@ def guess_question_type(text: str) -> str:
     return "management"
 
 
-def guess_topics(text: str) -> List[str]:
-    t = text.lower()
-    hits = []
+def classify_topics(text: str) -> Dict[str, List[str] | str | None]:
+    t = (text or "").lower()
+    scores = {k: 0 for k in TOPIC_SEEDS.keys()}
     for topic, seeds in TOPIC_SEEDS.items():
-        if any(re.search(seed, t) for seed in seeds):
-            hits.append(topic)
-    return hits or ["General IM"]
+        for seed in seeds:
+            if re.search(seed, t):
+                scores[topic] += 1
+    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+    primary = None
+    secondary = None
+    if ranked and ranked[0][1] > 0:
+        primary = ranked[0][0]
+        if len(ranked) > 1 and ranked[1][1] > 0 and ranked[1][1] >= max(1, int(0.5 * ranked[0][1])) and ranked[1][0] != primary:
+            secondary = ranked[1][0]
+    if not primary:
+        # sensible default
+        primary = "General IM"
+    return {"primary": primary, "secondary": secondary, "topics_list": [primary] + ([secondary] if secondary else [])}
+
 
 
 def suggest_error_types(your_answer: str, correct_answer: str, stem: str, explanation: str) -> List[str]:
@@ -194,11 +226,11 @@ def insert_log(row: Dict):
                 INSERT INTO logs (
                     created_at, source, exam, qnum, raw_question, choices,
                     your_answer, correct_answer, confidence, explanation_raw,
-                    topics, question_type, error_types, missed_clues, notes
+                    topics, primary_topic, secondary_topic, question_type, error_types, missed_clues, notes
                 ) VALUES (
                     :created_at, :source, :exam, :qnum, :raw_question, :choices,
                     :your_answer, :correct_answer, :confidence, :explanation_raw,
-                    :topics, :question_type, :error_types, :missed_clues, :notes
+                    :topics, :primary_topic, :secondary_topic, :question_type, :error_types, :missed_clues, :notes
                 )
                 """
             )
@@ -210,11 +242,11 @@ def insert_log(row: Dict):
                 INSERT INTO logs (
                     created_at, source, exam, qnum, raw_question, choices,
                     your_answer, correct_answer, confidence, explanation_raw,
-                    topics, question_type, error_types, missed_clues, notes
+                    topics, primary_topic, secondary_topic, question_type, error_types, missed_clues, notes
                 ) VALUES (
                     :created_at, :source, :exam, :qnum, :raw_question, :choices,
                     :your_answer, :correct_answer, :confidence, :explanation_raw,
-                    :topics, :question_type, :error_types, :missed_clues, :notes
+                    :topics, :primary_topic, :secondary_topic, :question_type, :error_types, :missed_clues, :notes
                 )
                 """
             )
@@ -224,6 +256,11 @@ def insert_log(row: Dict):
 def fetch_logs() -> pd.DataFrame:
     with engine.begin() as conn:
         df = pd.read_sql(text("SELECT * FROM logs ORDER BY id DESC"), conn)
+    # Back-compat: derive primary/secondary if missing
+    if "primary_topic" not in df.columns:
+        df["primary_topic"] = df.get("topics", pd.Series([], dtype=str)).fillna("").apply(lambda s: s.split(",")[0].strip() if s else "General IM")
+    if "secondary_topic" not in df.columns:
+        df["secondary_topic"] = df.get("topics", pd.Series([], dtype=str)).fillna("").apply(lambda s: s.split(",")[1].strip() if ("," in s) else None)
     return df
 
 
@@ -243,11 +280,8 @@ def compute_stats(df: pd.DataFrame) -> Dict:
     stats["total"] = len(df)
     stats["accuracy"] = float(df["is_correct"].mean()) if len(df) else 0.0
 
-    topics_exp = df.copy()
-    topics_exp["topics_list"] = topics_exp["topics"].fillna("").apply(lambda x: [t.strip() for t in x.split(",") if t.strip()])
-    topics_exp = topics_exp.explode("topics_list")
     topic_perf = (
-        topics_exp.groupby("topics_list").agg(n=("id","count"), acc=("is_correct","mean")).reset_index()
+        df.groupby("primary_topic").agg(n=("id","count"), acc=("is_correct","mean")).reset_index()
         .sort_values(["n","acc"], ascending=[False, True])
     )
     stats["topic_perf"] = topic_perf
@@ -301,8 +335,10 @@ if page == "Log New Question":
         with st.expander("Auto-suggested classifications (editable)", expanded=True):
             suggested_qtype = guess_question_type((raw_question or "") + "
 " + (explanation_raw or ""))
-            suggested_topics = guess_topics((raw_question or "") + "
+            topic_suggestion = classify_topics((raw_question or "") + "
 " + (explanation_raw or ""))
+            suggested_primary = topic_suggestion["primary"]
+            suggested_secondary = topic_suggestion["secondary"]
             suggested_errors = suggest_error_types(your_answer, correct_answer, raw_question, explanation_raw)
 
             question_type = st.selectbox(
@@ -310,7 +346,8 @@ if page == "Log New Question":
                 options=["diagnosis", "management", "workup", "interpretation", "mechanism"],
                 index=["diagnosis","management","workup","interpretation","mechanism"].index(suggested_qtype)
             )
-            topics = st.multiselect("Topic tags", options=sorted(list(TOPIC_SEEDS.keys()) + ["General IM"]), default=suggested_topics)
+            primary_topic = st.selectbox("Primary topic", options=sorted(list(TOPIC_SEEDS.keys()) + ["General IM"]), index=(sorted(list(TOPIC_SEEDS.keys()) + ["General IM"]).index(suggested_primary) if suggested_primary in (list(TOPIC_SEEDS.keys()) + ["General IM"]) else 0))
+            secondary_topic = st.selectbox("Secondary topic (optional)", options=["(none)"] + sorted(list(TOPIC_SEEDS.keys())), index=((["(none)"] + sorted(list(TOPIC_SEEDS.keys()))).index(suggested_secondary) if suggested_secondary in TOPIC_SEEDS else 0))
             error_types = st.multiselect("Error types", options=ERROR_TYPES, default=suggested_errors)
 
             missed_clues = st.text_area("Missed/Key clues (optional)", placeholder="e.g., S3, JVP↑, pulmonary edema")
@@ -335,7 +372,9 @@ if page == "Log New Question":
                     "correct_answer": (correct_answer or "").strip(),
                     "confidence": int(confidence),
                     "explanation_raw": (explanation_raw or "").strip(),
-                    "topics": ", ".join(topics),
+                    "topics": ", ".join([t for t in [primary_topic, (secondary_topic if secondary_topic != "(none)" else None)] if t]),
+                    "primary_topic": primary_topic,
+                    "secondary_topic": (secondary_topic if secondary_topic != "(none)" else None),
                     "question_type": question_type,
                     "error_types": ", ".join(error_types),
                     "missed_clues": (missed_clues or "").strip(),
@@ -371,10 +410,10 @@ elif page == "Dashboard":
         st.markdown("---")
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**Top Topics (volume & accuracy)**")
+            st.markdown("**Top Topics (by Primary) — volume & accuracy**")
             topic_perf = stats["topic_perf"]
-            st.dataframe(topic_perf, use_container_width=True)
-            st.bar_chart(topic_perf.set_index("topics_list")["n"], use_container_width=True)
+            st.dataframe(topic_perf.rename(columns={"primary_topic":"topic"}), use_container_width=True)
+            st.bar_chart(topic_perf.set_index("primary_topic")["n"], use_container_width=True)
         with c2:
             st.markdown("**Error Type Breakdown**")
             err_counts = stats["err_counts"]
@@ -383,7 +422,7 @@ elif page == "Dashboard":
 
         st.markdown("---")
         st.markdown("**Recent Entries**")
-        show_cols = ["created_at","source","exam","qnum","topics","question_type","your_answer","correct_answer"]
+        show_cols = ["created_at","source","exam","qnum","primary_topic","secondary_topic","question_type","your_answer","correct_answer"]
         st.dataframe(df[show_cols].head(10), use_container_width=True)
 
 elif page == "Review / Export":
@@ -405,16 +444,16 @@ elif page == "Review / Export":
             exms = ["(all)"] + sorted([s for s in df["exam"].dropna().unique() if s])
             f_exam = st.selectbox("Exam/Block", exms)
         with fcol3:
-            qtypes = ["(all)"] + sorted([q for q in df["question_type"].dropna().unique() if q])
-            f_qtype = st.selectbox("Question type", qtypes)
+            ptops = ["(all)"] + sorted([t for t in df["primary_topic"].dropna().unique() if t])
+            f_ptopic = st.selectbox("Primary topic", ptops)
 
         mask = pd.Series([True]*len(df))
         if f_source != "(all)":
             mask &= (df["source"] == f_source)
         if f_exam != "(all)":
             mask &= (df["exam"] == f_exam)
-        if f_qtype != "(all)":
-            mask &= (df["question_type"] == f_qtype)
+        if f_ptopic != "(all)":
+            mask &= (df["primary_topic"] == f_ptopic)
 
         view = df[mask].copy()
         st.dataframe(view, use_container_width=True)
@@ -452,7 +491,9 @@ elif page == "Health Check":
                     "question_type": "management",
                     "error_types": "",
                     "missed_clues": "",
-                    "notes": "healthcheck"
+                    "notes": "healthcheck",
+                    "primary_topic": "Diagnostics",
+                    "secondary_topic": None
                 }
                 insert_log(row)
                 st.success("Inserted test row.")
