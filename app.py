@@ -1,154 +1,164 @@
 import streamlit as st
 import pandas as pd
-import sqlalchemy
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker
-from datetime import datetime
+import re
 import os
+import datetime
+from sqlalchemy import create_engine, text
 
-# --- Database Setup ---
-DB_MODE = os.getenv("DB_MODE", "sqlite")  # default = SQLite
+# ---------------------------
+# Database Setup
+# ---------------------------
+DB_MODE = os.getenv("DB_MODE", "sqlite")  # default sqlite
+
 if DB_MODE == "postgres":
-    DB_URL = os.getenv("DB_URL")  # full Supabase/Postgres URL
+    DB_URL = os.getenv("DB_URL")
+    engine = create_engine(DB_URL, pool_pre_ping=True)
 else:
-    DB_URL = "sqlite:///questions.db"  # local SQLite fallback
+    DB_URL = "sqlite:///questions.db"
+    engine = create_engine(DB_URL)
 
-engine = create_engine(DB_URL, echo=True)
-Base = declarative_base()
-SessionLocal = sessionmaker(bind=engine)
-
-# --- DB Model ---
-class QuestionLog(Base):
-    __tablename__ = "question_logs"
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    raw_question = Column(Text)
-    choices = Column(Text)
-    user_answer = Column(String(50))
-    correct_answer = Column(String(50))
-    explanation = Column(Text)
-    reasoning = Column(Text)
-    qtype = Column(String(50))
-    primary_topic = Column(String(50))
-    secondary_topic = Column(String(50))
+# ---------------------------
+# Helper functions
+# ---------------------------
 
 def init_db():
-    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_question TEXT,
+                user_answer TEXT,
+                correct_answer TEXT,
+                explanation TEXT,
+                qtype TEXT,
+                topic_primary TEXT,
+                topic_secondary TEXT,
+                mistake_reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
 
-# --- Simple AI Guessing Helpers ---
-def guess_question_type(text: str) -> str:
-    """Naive keyword-based question type classifier."""
-    text = text.lower()
-    if "most likely diagnosis" in text or "what is the diagnosis" in text:
-        return "Diagnosis"
-    elif "next step" in text or "management" in text or "treatment" in text:
-        return "Management"
-    elif "mechanism" in text or "pathophysiology" in text:
-        return "Mechanism"
-    elif "risk factor" in text or "predisposes" in text:
-        return "Risk Factor"
-    else:
-        return "Other"
+# Seed keywords for classification
+TOPIC_SEEDS = {
+    "Cardiology": ["chest pain", "murmur", "MI", "ST elevation", "troponin", "AFib", "hypertension"],
+    "Pulmonology": ["dyspnea", "wheezing", "asthma", "COPD", "pneumonia", "hypoxemia"],
+    "Gastroenterology": ["abdominal pain", "diarrhea", "constipation", "IBS", "bloating", "rectal bleeding"],
+    "Nephrology": ["AKI", "CKD", "proteinuria", "hematuria", "casts", "dialysis", "oliguria", "anuria", "edema"],
+    "ObGyn": ["pregnant", "gestation", "LMP", "miscarriage", "postpartum", "contraception"],
+    "Endocrinology": ["diabetes", "thyroid", "cortisol", "adrenal", "pituitary"],
+    "Psychiatry": ["anxiety", "depression", "psychosis", "bipolar", "PTSD", "substance"],
+    "Neurology": ["seizure", "stroke", "weakness", "MS", "Parkinson", "neuropathy"],
+    "Dermatology": ["rash", "lesion", "eczema", "psoriasis", "melanoma"],
+    "HemeOnc": ["anemia", "lymphoma", "leukemia", "thrombocytopenia", "bleeding"],
+}
 
-def guess_topics(text: str):
-    """Naive keyword-based topic guesser (primary + secondary)."""
-    text = text.lower()
-    if "heart" in text or "cardiac" in text or "chest pain" in text:
-        return "Cardiology", "Cardiac symptoms"
-    elif "liver" in text or "hepatitis" in text:
-        return "Gastroenterology", "Hepatology"
-    elif "kidney" in text or "creatinine" in text:
-        return "Nephrology", "Renal function"
-    elif "pregnant" in text or "obstetric" in text:
-        return "Obstetrics", "Pregnancy"
-    elif "depression" in text or "psychiatry" in text:
-        return "Psychiatry", "Mood disorders"
-    else:
-        return "General", "Uncategorized"
+QTYPE_SEEDS = {
+    "Diagnosis": ["most likely diagnosis", "diagnosis", "dx"],
+    "Management": ["next step", "management", "initial treatment", "therapy"],
+    "Mechanism": ["pathophysiology", "mechanism"],
+    "Prognosis": ["prognosis", "outcome"],
+    "Ethics": ["ethics", "legal", "consent"],
+}
 
-# --- Streamlit App ---
-def main():
-    st.title("🧠 Step2Hub — Logger")
-    st.write("Log your NBME/Step2 questions and track weak points.")
+def classify_topics(text_block):
+    text_lower = text_block.lower()
+    scores = {topic: 0 for topic in TOPIC_SEEDS}
 
-    menu = ["Log Question", "Dashboard"]
-    choice = st.sidebar.selectbox("Menu", menu)
+    # Strong GI override
+    if any(kw in text_lower for kw in ["ibs", "irritable bowel", "diarrhea", "bloating", "defecation", "mucus in stool"]):
+        return "Gastroenterology", None
 
-    if choice == "Log Question":
-        log_question()
-    elif choice == "Dashboard":
-        show_dashboard()
+    for topic, seeds in TOPIC_SEEDS.items():
+        for seed in seeds:
+            if seed.lower() in text_lower:
+                # Nephrology gating: only count if strong kidney context
+                if topic == "Nephrology":
+                    if re.search(r"(proteinuria|hematuria|casts|aki|ckd|oliguria|anuria|dialysis|edema)", text_lower):
+                        scores[topic] += 2
+                else:
+                    scores[topic] += 1
 
-def log_question():
-    st.header("Log a Question")
+    # pick top two
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    primary = ranked[0][0] if ranked[0][1] > 0 else None
+    secondary = ranked[1][0] if ranked[1][1] > 0 else None
+    return primary, secondary
 
-    raw_question = st.text_area("Paste the Question")
-    choices = st.text_area("Paste the Choices (optional)")
-    user_answer = st.text_input("Your Answer")
-    correct_answer = st.text_input("Correct Answer")
-    reasoning = st.text_area("Why you chose your answer / reasoning")
-    explanation = st.text_area("Paste NBME Explanation")
+def guess_question_type(text_block):
+    text_lower = text_block.lower()
+    for qtype, seeds in QTYPE_SEEDS.items():
+        for seed in seeds:
+            if seed in text_lower:
+                return qtype
+    return None
 
-    if st.button("Submit"):
-        # Auto guess type & topics
-        combined_text = (raw_question or "") + " " + (explanation or "")
-        suggested_qtype = guess_question_type(combined_text)
-        primary_topic, secondary_topic = guess_topics(combined_text)
+# ---------------------------
+# Streamlit UI
+# ---------------------------
 
-        new_log = QuestionLog(
-            raw_question=raw_question,
-            choices=choices,
-            user_answer=user_answer,
-            correct_answer=correct_answer,
-            reasoning=reasoning,
-            explanation=explanation,
-            qtype=suggested_qtype,
-            primary_topic=primary_topic,
-            secondary_topic=secondary_topic,
-        )
+st.title("🧠 Step2Hub — Logger")
+st.caption("Log NBME-style questions with AI-assisted classification")
 
-        session = SessionLocal()
-        session.add(new_log)
-        session.commit()
-        session.close()
+init_db()
 
-        st.success("Question logged successfully!")
-        st.info(f"Auto-detected Type: **{suggested_qtype}**, Topics: **{primary_topic} → {secondary_topic}**")
+st.sidebar.header("Navigation")
+page = st.sidebar.radio("Go to", ["Log Question", "Dashboard"])
 
-def show_dashboard():
+if page == "Log Question":
+    st.header("➕ Log a new question")
+    with st.form("log_form"):
+        raw_question = st.text_area("Paste the full question vignette with answer choices")
+        user_answer = st.text_input("Your answer (letter/choice)")
+        correct_answer = st.text_input("Correct answer (letter/choice)")
+        explanation = st.text_area("Paste NBME explanation")
+
+        # AI suggestions
+        suggested_primary, suggested_secondary = classify_topics(raw_question + " " + explanation)
+        suggested_qtype = guess_question_type(raw_question + " " + explanation)
+
+        st.markdown("### Auto-suggested classifications")
+        topic_primary = st.selectbox("Primary topic", [None] + list(TOPIC_SEEDS.keys()), index=(list(TOPIC_SEEDS.keys()).index(suggested_primary) + 1 if suggested_primary else 0))
+        topic_secondary = st.selectbox("Secondary topic", [None] + list(TOPIC_SEEDS.keys()), index=(list(TOPIC_SEEDS.keys()).index(suggested_secondary) + 1 if suggested_secondary else 0))
+        qtype = st.selectbox("Question type", [None] + list(QTYPE_SEEDS.keys()), index=(list(QTYPE_SEEDS.keys()).index(suggested_qtype) + 1 if suggested_qtype else 0))
+
+        mistake_reason = st.text_area("Why did you get it wrong? (eg, misread labs, weak concept)")
+
+        submitted = st.form_submit_button("Save Question")
+        if submitted:
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO questions (raw_question, user_answer, correct_answer, explanation, qtype, topic_primary, topic_secondary, mistake_reason)
+                    VALUES (:raw_question, :user_answer, :correct_answer, :explanation, :qtype, :topic_primary, :topic_secondary, :mistake_reason)
+                """), {
+                    "raw_question": raw_question,
+                    "user_answer": user_answer,
+                    "correct_answer": correct_answer,
+                    "explanation": explanation,
+                    "qtype": qtype,
+                    "topic_primary": topic_primary,
+                    "topic_secondary": topic_secondary,
+                    "mistake_reason": mistake_reason,
+                })
+            st.success("✅ Question saved!")
+
+elif page == "Dashboard":
     st.header("📊 Dashboard")
-    session = SessionLocal()
-    data = session.query(QuestionLog).all()
-    session.close()
+    with engine.begin() as conn:
+        df = pd.read_sql("SELECT * FROM questions ORDER BY created_at DESC", conn)
+    
+    if df.empty:
+        st.info("No questions logged yet.")
+    else:
+        st.subheader("Overview")
+        st.metric("Total questions logged", len(df))
 
-    if not data:
-        st.write("No questions logged yet.")
-        return
+        col1, col2 = st.columns(2)
+        with col1:
+            topic_counts = df["topic_primary"].value_counts()
+            st.bar_chart(topic_counts)
+        with col2:
+            qtype_counts = df["qtype"].value_counts()
+            st.bar_chart(qtype_counts)
 
-    df = pd.DataFrame([{
-        "Timestamp": q.timestamp,
-        "Type": q.qtype,
-        "Primary Topic": q.primary_topic,
-        "Secondary Topic": q.secondary_topic,
-        "Your Answer": q.user_answer,
-        "Correct": q.correct_answer,
-        "Reasoning": q.reasoning,
-    } for q in data])
-
-    st.dataframe(df)
-
-    # Summary counts
-    st.subheader("Summary")
-    type_counts = df["Type"].value_counts()
-    topic_counts = df["Primary Topic"].value_counts()
-
-    st.write("**By Question Type:**")
-    st.bar_chart(type_counts)
-
-    st.write("**By Primary Topic:**")
-    st.bar_chart(topic_counts)
-
-# --- Run ---
-if __name__ == "__main__":
-    init_db()
-    main()
+        st.subheader("Detailed Table")
+        st.dataframe(df)
