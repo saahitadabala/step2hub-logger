@@ -35,6 +35,16 @@ else:
 
 
 st.set_page_config(page_title="Step2Hub — Logger", layout="wide")
+st.info(f"DB mode: {'Postgres' if DATABASE_URL else 'SQLite (fallback)'}")
+if DATABASE_URL:
+    try:
+        from sqlalchemy import text as satxt
+        with engine.begin() as conn:
+            conn.execute(satxt("select 1"))
+        st.success("Postgres connection OK")
+    except Exception as e:
+        st.error(f"Postgres connection FAILED: {e}")
+
 st.title("🧠 Step2Hub — Logger")
 st.caption("Cloud-easy MVP: SQLite by default, optional Supabase for permanent cloud storage.")
 
