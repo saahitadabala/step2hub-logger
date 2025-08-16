@@ -4,16 +4,26 @@ import time
 import datetime
 import json
 
-# --- Your existing imports and DB setup here ---
+# --- Example DB/logging helpers (yours may already have more sophisticated ones) ---
+def save_log(entry, filename="logs.jsonl"):
+    try:
+        with open(filename, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        st.warning(f"Logging failed: {e}")
 
-# ✅ List of topics
-TOPICS = ["Cardiology", "Pulmonology", "Gastroenterology", "Nephrology", "Obstetrics & Gynecology", "Neurology", "Endocrinology", "Infectious Disease", "Psychiatry"]
+# ✅ Topics
+TOPICS = [
+    "Cardiology", "Pulmonology", "Gastroenterology", "Nephrology",
+    "Obstetrics & Gynecology", "Neurology", "Endocrinology",
+    "Infectious Disease", "Psychiatry"
+]
 
-# ✅ Example AI question generator
+# ✅ Sample NBME-style AI-generated questions
 def generate_ai_question(topic=None):
     if topic is None or topic == "(Random)":
         topic = random.choice(TOPICS)
-    # For now, just a sample pool. Expand as needed.
+
     pool = {
         "Gastroenterology": {
             "stem": "A 32-year-old woman presents with intermittent abdominal pain and alternating constipation and diarrhea. Workup is normal. What is the most likely diagnosis?",
@@ -36,10 +46,31 @@ def generate_ai_question(topic=None):
             )
         }
     }
+
     return pool.get(topic, pool["Gastroenterology"])
 
-# --- Streamlit UI ---
+# --- NBME LOGGER TAB (original functionality) ---
+def logger_tab():
+    st.header("📘 NBME Question Logger")
 
+    raw_question = st.text_area("Paste NBME Question Here")
+    chosen_answer = st.text_input("Your Answer")
+    correct_answer = st.text_input("Correct Answer")
+    explanation = st.text_area("Explanation")
+
+    if st.button("Log Question"):
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "raw_question": raw_question,
+            "chosen_answer": chosen_answer,
+            "correct_answer": correct_answer,
+            "explanation": explanation,
+            "source": "NBME"
+        }
+        save_log(entry, filename="nbme_logs.jsonl")
+        st.success("✅ Question logged!")
+
+# --- PRACTICE QBANK TAB (AI) ---
 def practice_tab():
     st.header("🧠 Practice QBank (AI)")
     st.write("NBME-style questions, one at a time. Pick a topic or go random.")
@@ -70,27 +101,22 @@ def practice_tab():
                 st.error(f"❌ Incorrect. You chose **{chosen}**. The correct answer is **{correct}**.")
             st.info(q["explanation"])
 
-            # ✅ Log automatically
+            # ✅ Auto-log AI question attempts
             log_entry = {
                 "timestamp": datetime.datetime.now().isoformat(),
                 "topic": topic_choice if topic_choice != "(Random)" else q.get("topic", "Unknown"),
-                "raw_question": q["stem"],  # ✅ fixed: no stray + "
+                "raw_question": q["stem"],
                 "answer": chosen,
                 "correct": chosen == correct,
                 "source": "AI_QBANK"
             }
-            try:
-                with open("ai_logs.jsonl", "a") as f:
-                    f.write(json.dumps(log_entry) + "\n")
-            except Exception as e:
-                st.warning(f"Logging failed: {e}")
+            save_log(log_entry, filename="ai_logs.jsonl")
 
-# --- Main App ---
+# --- MAIN APP ---
 def main():
     tabs = st.tabs(["Logger", "Practice QBank (AI)"])
     with tabs[0]:
-        st.write("📘 Your Step2Hub Logger")
-        # your existing logger tab code here
+        logger_tab()
     with tabs[1]:
         practice_tab()
 
