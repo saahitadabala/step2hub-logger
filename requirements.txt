@@ -1,0 +1,6 @@
+streamlit
+pandas
+python-dateutil
+# Only needed if you add a cloud database URL in secrets:
+SQLAlchemy
+psycopg2-binary
