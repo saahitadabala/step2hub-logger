@@ -46,14 +46,14 @@ def init_db():
 
 # Seed keywords for classification
 TOPIC_SEEDS = {
-    "Cardiology": ["chest pain", "murmur", "mi", "st elevation", "troponin", "afib", "hypertension"],
-    "Pulmonology": ["dyspnea", "wheezing", "asthma", "copd", "pneumonia", "hypoxemia"],
-    "Gastroenterology": ["abdominal pain", "diarrhea", "constipation", "ibs", "bloating", "rectal bleeding"],
-    "Nephrology": ["aki", "ckd", "proteinuria", "hematuria", "casts", "dialysis", "oliguria", "anuria", "edema"],
-    "ObGyn": ["pregnant", "gestation", "lmp", "miscarriage", "postpartum", "contraception"],
+    "Cardiology": ["chest pain", "murmur", "MI", "ST elevation", "troponin", "AFib", "hypertension"],
+    "Pulmonology": ["dyspnea", "wheezing", "asthma", "COPD", "pneumonia", "hypoxemia"],
+    "Gastroenterology": ["abdominal pain", "diarrhea", "constipation", "IBS", "bloating", "rectal bleeding"],
+    "Nephrology": ["AKI", "CKD", "proteinuria", "hematuria", "casts", "dialysis", "oliguria", "anuria", "edema"],
+    "ObGyn": ["pregnant", "gestation", "LMP", "miscarriage", "postpartum", "contraception"],
     "Endocrinology": ["diabetes", "thyroid", "cortisol", "adrenal", "pituitary"],
-    "Psychiatry": ["anxiety", "depression", "psychosis", "bipolar", "ptsd", "substance"],
-    "Neurology": ["seizure", "stroke", "weakness", "ms", "parkinson", "neuropathy"],
+    "Psychiatry": ["anxiety", "depression", "psychosis", "bipolar", "PTSD", "substance"],
+    "Neurology": ["seizure", "stroke", "weakness", "MS", "Parkinson", "neuropathy"],
     "Dermatology": ["rash", "lesion", "eczema", "psoriasis", "melanoma"],
     "HemeOnc": ["anemia", "lymphoma", "leukemia", "thrombocytopenia", "bleeding"],
 }
@@ -76,7 +76,7 @@ def classify_topics(text_block: str):
 
     for topic, seeds in TOPIC_SEEDS.items():
         for seed in seeds:
-            if seed in text_lower:
+            if seed.lower() in text_lower:
                 # Nephrology gating: only count if strong kidney context
                 if topic == "Nephrology":
                     if re.search(r"(proteinuria|hematuria|casts|aki|ckd|oliguria|anuria|dialysis|edema)", text_lower):
@@ -191,7 +191,7 @@ elif page == "Practice QBank (AI)":
         explanation = ""
         rationales = {}
 
-        # Handcrafted high-yield items (concise, thorough explanations + distractor rationales)
+        # Handcrafted high-yield items (concise, but thorough explanations + distractor rationales)
         if topic == "Gastroenterology" and qtype in ("Management", "Diagnosis"):
             stem = (
                 "A 28-year-old woman has 8 months of intermittent crampy lower abdominal pain with 3–4 loose stools/day. "
