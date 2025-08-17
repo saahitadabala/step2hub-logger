@@ -2,24 +2,19 @@ import streamlit as st
 import pandas as pd
 import re
 import os
-import datetime
+from random import choice as rnd_choice, shuffle
 from sqlalchemy import create_engine, text
 
-# ---------------------------
+# =========================
 # Database Setup
-# ---------------------------
-DB_MODE = os.getenv("DB_MODE", "sqlite")  # default sqlite
-
+# =========================
+DB_MODE = os.getenv("DB_MODE", "sqlite")  # "sqlite" or "postgres"
 if DB_MODE == "postgres":
     DB_URL = os.getenv("DB_URL")
     engine = create_engine(DB_URL, pool_pre_ping=True)
 else:
     DB_URL = "sqlite:///questions.db"
     engine = create_engine(DB_URL)
-
-# ---------------------------
-# Helper functions
-# ---------------------------
 
 def init_db():
     with engine.begin() as conn:
@@ -38,13 +33,15 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        # Lightweight migration for older tables (ignore error if column exists)
+        # best-effort migration for "source"
         try:
             conn.execute(text("ALTER TABLE questions ADD COLUMN source TEXT DEFAULT 'USER_PASTED'"))
         except Exception:
             pass
 
-# Seed keywords for classification
+# =========================
+# Classification helpers (used for Logger tab only)
+# =========================
 TOPIC_SEEDS = {
     "Cardiology": ["chest pain", "murmur", "mi", "st elevation", "troponin", "afib", "hypertension"],
     "Pulmonology": ["dyspnea", "wheezing", "asthma", "copd", "pneumonia", "hypoxemia"],
@@ -78,14 +75,12 @@ def classify_topics(text_block: str):
     for topic, seeds in TOPIC_SEEDS.items():
         for seed in seeds:
             if seed in text_lower:
-                # Nephrology gating: only count if strong kidney context
                 if topic == "Nephrology":
                     if re.search(r"(proteinuria|hematuria|casts|aki|ckd|oliguria|anuria|dialysis|edema)", text_lower):
                         scores[topic] += 2
                 else:
                     scores[topic] += 1
 
-    # pick top two
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     primary = ranked[0][0] if ranked[0][1] > 0 else None
     secondary = ranked[1][0] if ranked[1][1] > 0 else None
@@ -99,10 +94,287 @@ def guess_question_type(text_block: str):
                 return qtype
     return None
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
+# =========================
+# NBME-style templates (AI QBank)
+#   - Each entry has one realistic vignette with A–E options.
+#   - We randomize order and map to letters, preserving correct/rationales.
+# =========================
+TEMPLATES = [
+    # Cardiology
+    {
+        "topic": "Cardiology", "qtype": "Diagnosis",
+        "stem": ("A 65-year-old man with long-standing hypertension develops sudden severe tearing chest pain radiating "
+                 "to the back. Blood pressure is higher in the right arm than the left. A new early diastolic murmur is "
+                 "heard at the left sternal border. Which of the following is the most likely diagnosis?"),
+        "options": ["Acute pericarditis", "Aortic dissection", "Pulmonary embolism",
+                    "ST-elevation myocardial infarction", "Tension pneumothorax"],
+        "correct": "Aortic dissection",
+        "rationales": {
+            "Acute pericarditis": "Typically pleuritic and positional chest pain after a viral prodrome; no pulse/BP differential.",
+            "Aortic dissection": "Correct — tearing pain to the back with limb BP differential and new AR murmur.",
+            "Pulmonary embolism": "Pleuritic pain and hypoxia are more typical; no AR murmur or limb BP difference.",
+            "ST-elevation myocardial infarction": "Pressure-like pain with ischemic ECG; tearing pain and BP asymmetry suggest dissection.",
+            "Tension pneumothorax": "Hypotension, JVD, and absent breath sounds dominate; murmur and BP differential not expected."
+        },
+        "explanation": ("A classic presentation of ascending aortic dissection includes tearing chest pain radiating to the back, "
+                        "pulse/BP differential, and acute aortic regurgitation (early diastolic murmur).")
+    },
+    {
+        "topic": "Cardiology", "qtype": "Management",
+        "stem": ("A 72-year-old man has crushing chest pain at rest for 30 minutes with diaphoresis. "
+                 "ECG shows 2-mm ST elevations in leads II, III, and aVF. What is the most appropriate next step in management?"),
+        "options": ["Immediate aspirin and emergent PCI activation", "Schedule an outpatient stress test",
+                    "Give sublingual nitroglycerin only and discharge",
+                    "Order a transthoracic echocardiogram and observe",
+                    "Start heparin and wait 24 hours before intervention"],
+        "correct": "Immediate aspirin and emergent PCI activation",
+        "rationales": {
+            "Immediate aspirin and emergent PCI activation": "Correct — reperfusion is time critical for STEMI.",
+            "Schedule an outpatient stress test": "Stress testing is contraindicated during active ischemia.",
+            "Give sublingual nitroglycerin only and discharge": "Unsafe disposition; delays definitive reperfusion.",
+            "Order a transthoracic echocardiogram and observe": "Echo should not delay reperfusion in a clear STEMI.",
+            "Start heparin and wait 24 hours before intervention": "Anticoagulation alone is not definitive therapy for STEMI."
+        },
+        "explanation": ("Inferior STEMI requires immediate antiplatelet therapy and prompt reperfusion (PCI within the guideline window).")
+    },
+    {
+        "topic": "Cardiology", "qtype": "Workup",
+        "stem": ("A 58-year-old woman reports substernal chest pressure reliably provoked by brisk walking for 3 months. "
+                 "Her resting ECG is normal. Which is the best initial diagnostic test?"),
+        "options": ["Exercise treadmill ECG stress test", "CT coronary angiography",
+                    "Cardiac MRI with gadolinium", "Serial troponins", "BNP level"],
+        "correct": "Exercise treadmill ECG stress test",
+        "rationales": {
+            "Exercise treadmill ECG stress test": "Correct — first-line for stable angina with interpretable baseline ECG.",
+            "CT coronary angiography": "Reasonable in some cases but not first-line for classic stable angina.",
+            "Cardiac MRI with gadolinium": "Useful for tissue characterization; not the best initial test here.",
+            "Serial troponins": "For suspected ACS; this is chronic stable symptoms.",
+            "BNP level": "Assesses heart failure, not ischemia evaluation."
+        },
+        "explanation": ("Stable, exertional symptoms with normal resting ECG and ability to exercise → exercise treadmill ECG is the initial test.")
+    },
 
+    # Gastroenterology
+    {
+        "topic": "Gastroenterology", "qtype": "Management",
+        "stem": ("A 28-year-old woman has 8 months of crampy lower abdominal pain with 3–4 loose stools/day. Pain improves after defecation. "
+                 "There is no weight loss or GI bleeding. Basic labs (CBC, CRP) and celiac serology are normal. What is the next best step?"),
+        "options": ["Colonoscopy", "Fecal fat quantification", "CT abdomen with contrast",
+                    "No further testing necessary", "Stool ova and parasites (×3)"],
+        "correct": "No further testing necessary",
+        "rationales": {
+            "Colonoscopy": "Reserved for alarm features or age-appropriate screening.",
+            "Fecal fat quantification": "Used for suspected malabsorption with steatorrhea/weight loss.",
+            "CT abdomen with contrast": "For intra-abdominal pathology or alarm features, not classic IBS.",
+            "No further testing necessary": "Correct — classic IBS without alarms after minimal evaluation.",
+            "Stool ova and parasites (×3)": "Used with travel/exposure risk; not suggested here."
+        },
+        "explanation": ("Chronic abdominal pain related to defecation with altered stool form/frequency without alarm features and with normal basic workup "
+                        "is consistent with IBS; invasive testing is not indicated.")
+    },
+
+    # Pulmonology
+    {
+        "topic": "Pulmonology", "qtype": "Workup",
+        "stem": ("A 48-year-old postoperative patient develops sudden pleuritic chest pain and dyspnea. HR 112/min, RR 24/min, SpO₂ 94% on room air. "
+                 "He is hemodynamically stable. What is the most appropriate next diagnostic test?"),
+        "options": ["D-dimer", "CT pulmonary angiography", "Ventilation–perfusion scan",
+                    "Transthoracic echocardiography", "Serial troponins"],
+        "correct": "CT pulmonary angiography",
+        "rationales": {
+            "D-dimer": "Useful to rule out PE in low-risk patients; not appropriate at moderate/high suspicion.",
+            "CT pulmonary angiography": "Correct — first-line diagnostic test for stable patients when not contraindicated.",
+            "Ventilation–perfusion scan": "Alternative when CTPA is contraindicated or renal function is poor.",
+            "Transthoracic echocardiography": "Assesses right heart strain; does not confirm PE in a stable patient.",
+            "Serial troponins": "Primarily evaluate myocardial injury."
+        },
+        "explanation": ("In a stable patient with moderate/high suspicion for PE, CTPA is preferred; V/Q is used when contrast cannot be given.")
+    },
+
+    # Endocrinology
+    {
+        "topic": "Endocrinology", "qtype": "Management",
+        "stem": ("A 24-year-old with type 1 diabetes presents with abdominal pain, Kussmaul respirations, and glucose 520 mg/dL. "
+                 "Which is the most appropriate initial management step?"),
+        "options": ["IV insulin bolus", "IV isotonic saline", "IV sodium bicarbonate", "Subcutaneous insulin", "Broad-spectrum antibiotics"],
+        "correct": "IV isotonic saline",
+        "rationales": {
+            "IV insulin bolus": "Insulin is essential but after initial fluid resuscitation.",
+            "IV isotonic saline": "Correct — fluids first in DKA to restore perfusion.",
+            "IV sodium bicarbonate": "Rarely indicated; may worsen outcomes if used indiscriminately.",
+            "Subcutaneous insulin": "Absorption is unreliable during DKA.",
+            "Broad-spectrum antibiotics": "Treat if infection suspected, but not the initial step here."
+        },
+        "explanation": ("DKA management prioritizes aggressive fluid resuscitation before insulin; potassium must be monitored closely.")
+    },
+
+    # Neurology
+    {
+        "topic": "Neurology", "qtype": "Workup",
+        "stem": ("A 69-year-old develops sudden right-sided weakness and expressive aphasia 45 minutes ago. BP 168/94. "
+                 "What is the best initial diagnostic test?"),
+        "options": ["Non-contrast CT of the head", "MRI brain with diffusion", "CT angiography of head and neck",
+                    "EEG", "Carotid duplex ultrasound"],
+        "correct": "Non-contrast CT of the head",
+        "rationales": {
+            "Non-contrast CT of the head": "Correct — first to exclude intracranial hemorrhage before thrombolysis.",
+            "MRI brain with diffusion": "Highly sensitive for ischemia but not first step in acute evaluation.",
+            "CT angiography of head and neck": "Useful after hemorrhage is excluded to evaluate vessels.",
+            "EEG": "Not part of initial stroke evaluation.",
+            "Carotid duplex ultrasound": "Outpatient evaluation; not the first step in acute stroke."
+        },
+        "explanation": ("In suspected acute stroke, immediate non-contrast head CT is required to rule out hemorrhage and determine eligibility for reperfusion therapy.")
+    },
+
+    # ObGyn
+    {
+        "topic": "ObGyn", "qtype": "Workup",
+        "stem": ("A 28-year-old woman with 6 weeks of amenorrhea presents with lower abdominal pain and light vaginal bleeding. "
+                 "β-hCG is positive. What is the most appropriate next step in evaluation?"),
+        "options": ["Transvaginal ultrasound", "Endometrial biopsy", "Methotrexate therapy now",
+                    "Repeat β-hCG in 1 week only", "Dilation and curettage immediately"],
+        "correct": "Transvaginal ultrasound",
+        "rationales": {
+            "Transvaginal ultrasound": "Correct — first-line to evaluate for intrauterine vs ectopic pregnancy.",
+            "Endometrial biopsy": "Not indicated in early pregnancy evaluation for ectopic.",
+            "Methotrexate therapy now": "Treatment is considered after diagnosis; not prior to imaging confirmation.",
+            "Repeat β-hCG in 1 week only": "Delays diagnosis and risks rupture.",
+            "Dilation and curettage immediately": "Not first-line and risks terminating a viable intrauterine pregnancy."
+        },
+        "explanation": ("In a pregnant patient with pain/bleeding, TVUS is the initial step to localize the pregnancy and assess for ectopic.")
+    },
+
+    # Nephrology
+    {
+        "topic": "Nephrology", "qtype": "Diagnosis",
+        "stem": ("A 70-year-old man with vomiting and poor intake has BUN 48 mg/dL and creatinine 2.1 mg/dL. "
+                 "Urine sodium is 8 mEq/L and FeNa is 0.5%. Which of the following is the most likely cause of his acute kidney injury?"),
+        "options": ["Acute tubular necrosis", "Pre-renal azotemia", "Acute interstitial nephritis",
+                    "Post-renal obstruction", "Rapidly progressive glomerulonephritis"],
+        "correct": "Pre-renal azotemia",
+        "rationales": {
+            "Acute tubular necrosis": "Typically FeNa >2% with muddy brown casts.",
+            "Pre-renal azotemia": "Correct — low urine sodium and FeNa <1% suggest hypoperfusion.",
+            "Acute interstitial nephritis": "Associated with eosinophils, rash, and fever after new drugs.",
+            "Post-renal obstruction": "Hydronephrosis on imaging; not supported by low FeNa.",
+            "Rapidly progressive glomerulonephritis": "Hematuria/proteinuria with casts and systemic features."
+        },
+        "explanation": ("Low FeNa and low urine sodium indicate sodium avidity due to hypoperfusion → pre-renal azotemia.")
+    },
+
+    # Infectious Disease
+    {
+        "topic": "Infectious Disease", "qtype": "Management",
+        "stem": ("A 22-year-old college student presents with fever, headache, neck stiffness, and petechial rash. "
+                 "She is somnolent but arousable. What is the most appropriate next step in management?"),
+        "options": ["Start IV ceftriaxone and vancomycin immediately", "Obtain LP first, then start antibiotics",
+                    "Order brain MRI, then LP", "Begin steroids only", "Observe for 6 hours and repeat exam"],
+        "correct": "Start IV ceftriaxone and vancomycin immediately",
+        "rationales": {
+            "Start IV ceftriaxone and vancomycin immediately": "Correct — do not delay empiric therapy in suspected bacterial meningitis.",
+            "Obtain LP first, then start antibiotics": "Antibiotics should not be delayed; cultures can be drawn before LP.",
+            "Order brain MRI, then LP": "Imaging only if focal deficits/seizure/immunocompromise — still should not delay antibiotics.",
+            "Begin steroids only": "Dexamethasone can be added, but antibiotics are urgent.",
+            "Observe for 6 hours and repeat exam": "Dangerous delay in a rapidly progressive infection."
+        },
+        "explanation": ("Suspected bacterial meningitis is a medical emergency; initiate empiric antibiotics immediately after blood cultures.")
+    },
+
+    # Heme/Onc
+    {
+        "topic": "HemeOnc", "qtype": "Diagnosis",
+        "stem": ("Minutes after the start of a blood transfusion, a patient develops fever, flank pain, and dark urine. "
+                 "Blood pressure drops and oozing is noted at IV sites. Which of the following is the most likely diagnosis?"),
+        "options": ["Anaphylactic reaction", "Acute hemolytic transfusion reaction", "Febrile non-hemolytic transfusion reaction",
+                    "TRALI", "Urticarial reaction"],
+        "correct": "Acute hemolytic transfusion reaction",
+        "rationales": {
+            "Anaphylactic reaction": "Hypotension with wheeze/angioedema, especially in IgA deficiency; hemoglobinuria less typical.",
+            "Acute hemolytic transfusion reaction": "Correct — ABO incompatibility causes fever, flank pain, hemoglobinuria, DIC, and shock.",
+            "Febrile non-hemolytic transfusion reaction": "Fever and chills only; due to cytokines in donor plasma.",
+            "TRALI": "Acute hypoxemia and pulmonary edema within 6 hours; not hemoglobinuria/DIC.",
+            "Urticarial reaction": "Pruritus and hives without systemic instability."
+        },
+        "explanation": ("Acute hemolytic transfusion reactions are due to ABO incompatibility leading to intravascular hemolysis, DIC, and shock.")
+    },
+
+    # Dermatology
+    {
+        "topic": "Dermatology", "qtype": "Management",
+        "stem": ("A 42-year-old woman has a 1.2-cm irregularly pigmented lesion with asymmetric borders and color variation on the calf. "
+                 "What is the most appropriate next step in management?"),
+        "options": ["Excisional biopsy with narrow margins", "Shave biopsy", "Topical imiquimod",
+                    "Wide local excision to fascia", "Observation in 3 months"],
+        "correct": "Excisional biopsy with narrow margins",
+        "rationales": {
+            "Excisional biopsy with narrow margins": "Correct — diagnostic approach for suspected melanoma.",
+            "Shave biopsy": "May transect lesion and underestimate depth.",
+            "Topical imiquimod": "Used for superficial lesions (e.g., BCC); not for suspected melanoma.",
+            "Wide local excision to fascia": "Definitive treatment determined by Breslow depth after diagnostic biopsy.",
+            "Observation in 3 months": "Delays diagnosis of potentially invasive melanoma."
+        },
+        "explanation": ("Suspicious melanocytic lesions require full-thickness excisional biopsy with narrow margins to assess Breslow depth.")
+    },
+
+    # Psychiatry
+    {
+        "topic": "Psychiatry", "qtype": "Diagnosis",
+        "stem": ("A patient on sertraline develops agitation, tremor, hyperreflexia, mydriasis, and hyperthermia after adding linezolid. "
+                 "What is the most likely diagnosis?"),
+        "options": ["Neuroleptic malignant syndrome", "Serotonin syndrome", "Anticholinergic toxicity",
+                    "Malignant hyperthermia", "Opioid overdose"],
+        "correct": "Serotonin syndrome",
+        "rationales": {
+            "Neuroleptic malignant syndrome": "Rigidity and hyporeflexia with dopaminergic blockade; slower onset.",
+            "Serotonin syndrome": "Correct — triad of mental-status change, autonomic instability, and neuromuscular hyperactivity.",
+            "Anticholinergic toxicity": "Dry skin, mydriasis, urinary retention; not hyperreflexia/clonus.",
+            "Malignant hyperthermia": "Occurs with inhaled anesthetics/succinylcholine intra-op; rigidity, hypercarbia.",
+            "Opioid overdose": "Miosis and respiratory depression; not hyperreflexia."
+        },
+        "explanation": ("Serotonin excess from SSRI + MAOI-like agent causes agitation, hyperthermia, and hyperreflexia/clonus.")
+    },
+]
+
+TOPICS = sorted(set(t["topic"] for t in TEMPLATES))  # used in QBank UI
+
+def pick_template(topic_choice: str):
+    """Pick a random template for a specific topic or any topic if '(Random)'."""
+    pool = [t for t in TEMPLATES if topic_choice == "(Random)" or t["topic"] == topic_choice]
+    return rnd_choice(pool)
+
+def assemble_question_from_template(tpl: dict):
+    """Shuffle options, map to letters, and compute correct letter + per-letter rationales."""
+    opts = tpl["options"][:]
+    shuffle(opts)
+    letters = ["A", "B", "C", "D", "E"]
+    # Ensure 5 options; if fewer, pad with plausible distractor placeholders (rare)
+    while len(opts) < 5:
+        opts.append(f"Option {len(opts)+1}")
+    opts = opts[:5]
+    choices = list(zip(letters, opts))
+
+    correct_text = tpl["correct"]
+    # find letter that matches the correct option text
+    correct_letter = next((ltr for ltr, txt in choices if txt == correct_text), "A")
+
+    # map rationales by letter
+    rats = {ltr: tpl["rationales"].get(txt, "Less appropriate than the best answer in this vignette.")
+            for ltr, txt in choices}
+
+    return {
+        "topic": tpl["topic"],
+        "qtype": tpl["qtype"],
+        "stem": tpl["stem"],
+        "choices": choices,             # list of (letter, text)
+        "correct": correct_letter,      # "A".."E"
+        "explanation": tpl["explanation"],
+        "rationales": rats,
+    }
+
+# =========================
+# Streamlit App
+# =========================
+st.set_page_config(page_title="Step2Hub — Logger", page_icon="🧠", layout="wide")
 st.title("🧠 Step2Hub — Logger")
 st.caption("Log NBME-style questions with AI-assisted classification + your own AI QBank")
 
@@ -111,9 +383,7 @@ init_db()
 st.sidebar.header("Navigation")
 page = st.sidebar.radio("Go to", ["Log Question", "Practice QBank (AI)", "Dashboard"])
 
-# ---------------------------
-# Page: Log Question (user-pasted)
-# ---------------------------
+# --------- Log Question ---------
 if page == "Log Question":
     st.header("➕ Log a new question")
     with st.form("log_form"):
@@ -128,16 +398,17 @@ if page == "Log Question":
 
         st.markdown("### Auto-suggested classifications")
         topic_primary = st.selectbox(
-            "Primary topic", [None] + list(TOPIC_SEEDS.keys()),
-            index=(list(TOPIC_SEEDS.keys()).index(suggested_primary) + 1 if suggested_primary else 0)
+            "Primary topic", [None] + sorted(TOPIC_SEEDS.keys()),
+            index=(sorted(TOPIC_SEEDS.keys()).index(suggested_primary) + 1 if suggested_primary in TOPIC_SEEDS else 0)
         )
         topic_secondary = st.selectbox(
-            "Secondary topic", [None] + list(TOPIC_SEEDS.keys()),
-            index=(list(TOPIC_SEEDS.keys()).index(suggested_secondary) + 1 if suggested_secondary else 0)
+            "Secondary topic", [None] + sorted(TOPIC_SEEDS.keys()),
+            index=(sorted(TOPIC_SEEDS.keys()).index(suggested_secondary) + 1 if suggested_secondary in TOPIC_SEEDS else 0)
         )
         qtype = st.selectbox(
-            "Question type", [None] + ["Diagnosis", "Management", "Workup", "Mechanism", "Prognosis", "Ethics"],
-            index=(["Diagnosis","Management","Workup","Mechanism","Prognosis","Ethics"].index(suggested_qtype) + 1 if suggested_qtype in ["Diagnosis","Management","Workup","Mechanism","Prognosis","Ethics"] else 0)
+            "Question type", [None, "Diagnosis", "Management", "Workup", "Mechanism", "Prognosis", "Ethics"],
+            index=([None, "Diagnosis", "Management", "Workup", "Mechanism", "Prognosis", "Ethics"].index(suggested_qtype)
+                   if suggested_qtype in {"Diagnosis","Management","Workup","Mechanism","Prognosis","Ethics"} else 0)
         )
 
         mistake_reason = st.text_area("Why did you get it wrong? (eg, misread labs, weak concept)")
@@ -161,211 +432,32 @@ if page == "Log Question":
                 })
             st.success("✅ Question saved!")
 
-# ---------------------------
-# Page: Practice QBank (AI)
-# ---------------------------
+# --------- Practice QBank (AI) ---------
 elif page == "Practice QBank (AI)":
     st.header("🧪 Practice QBank (AI)")
-
-    # --- Controls ---
     colL, colR = st.columns([2,1])
     with colL:
-        qb_topic_choice = st.selectbox("Topic", ["(Random)"] + list(TOPIC_SEEDS.keys()))
+        qb_topic_choice = st.selectbox("Topic", ["(Random)"] + sorted(TOPICS))
     with colR:
         if st.button("Generate New Question", use_container_width=True):
             st.session_state.pop("qb_current", None)
             st.session_state.pop("qb_answer", None)
 
-    # Utility to pick a topic when (Random) is selected
-    from random import choice as rnd_choice, shuffle
-
-    def pick_topic(topic_choice: str) -> str:
-        return rnd_choice(list(TOPIC_SEEDS.keys())) if topic_choice == "(Random)" else topic_choice
-
-    # --- NBME-style generator ---
-    # Returns: stem (str), choices (list[(letter,text)]), correct_letter (str), explanation (str), rationales (dict letter->why wrong/right)
-    def generate_nbme_style_question(topic: str):
-        qtype = rnd_choice(["Diagnosis", "Management", "Workup"])  # keep to templates we support now
-        stem = ""
-        bank = []
-        correct = None
-        explanation = ""
-        rationales = {}
-
-        # GI – IBS next step
-        if topic == "Gastroenterology" and qtype in ("Management", "Diagnosis"):
-            stem = (
-                "A 28-year-old woman has 8 months of intermittent crampy lower abdominal pain with 3–4 loose stools/day. "
-                "Pain improves after defecation. No weight loss, fever, or GI bleeding. Exam: mild LLQ tenderness. Basic labs normal. "
-                "What is the most appropriate next step?"
-            )
-            bank = [
-                ("A", "Colonoscopy"),
-                ("B", "Fecal fat quantification"),
-                ("C", "CT abdomen with contrast"),
-                ("D", "No further testing necessary"),
-                ("E", "Stool ova and parasites (×3)"),
-            ]
-            correct = "D"
-            explanation = (
-                "**IBS** is suggested by chronic abdominal pain related to defecation and altered bowel habits **without alarm features** (no weight loss, anemia, blood in stool, age <50) and with normal basic labs. "
-                "For suspected IBS with diarrhea-predominance, rule out red flags and obtain minimal labs (CBC, celiac serology, inflammatory/infectious markers). **If unremarkable, no further invasive testing** is indicated."
-            )
-            rationales = {
-                "A": "Colonoscopy is for alarm features or age-appropriate screening; not indicated here.",
-                "B": "Fecal fat is for suspected malabsorption with steatorrhea/weight loss, which are absent.",
-                "C": "CT abdomen is for intra-abdominal pathology or red flags; not first-line in classic IBS.",
-                "D": "Correct — classic IBS without alarms after minimal evaluation.",
-                "E": "Stool O&P is for exposure/travel/epidemiologic risk; not suggested in this vignette.",
-            }
-
-        # Cardiology – Dx (dissection)
-        elif topic == "Cardiology" and qtype in ("Diagnosis",):
-            stem = (
-                "A 65-year-old man with hypertension develops sudden severe tearing chest pain radiating to the back. "
-                "Right arm BP 190/110; left 160/90. Early diastolic murmur at the left sternal border. Most likely diagnosis?"
-            )
-            bank = [("A", "Acute pericarditis"), ("B", "Aortic dissection"), ("C", "Pulmonary embolism"), ("D", "ST-elevation myocardial infarction"), ("E", "Tension pneumothorax")]
-            correct = "B"
-            explanation = (
-                "Tearing pain to the back + **pulse/BP differential** and a new **diastolic murmur** (aortic regurgitation) are classic for **aortic dissection**."
-            )
-            rationales = {
-                "A": "Pericarditis is pleuritic, positional, and typically follows a viral prodrome; no BP differential.",
-                "B": "Correct — dissection produces AR and limb BP differences.",
-                "C": "PE causes pleuritic pain and hypoxia; tearing pain and BP differential are not typical.",
-                "D": "STEMI pain is pressure-like with ischemic ECG; no tearing pain or BP asymmetry.",
-                "E": "Tension pneumothorax has hypotension, JVD, and absent breath sounds, not a diastolic murmur.",
-            }
-
-        # Cardiology – Management (STEMI)
-        elif topic == "Cardiology" and qtype in ("Management",):
-            stem = (
-                "A 72-year-old man has crushing chest pain at rest for 30 minutes with diaphoresis. "
-                "BP 138/84, HR 96, SpO2 96% RA. ECG shows 2-mm ST elevation in II, III, aVF. What is the most appropriate next step?"
-            )
-            bank = [
-                ("A", "Immediate aspirin and emergent PCI activation"),
-                ("B", "Schedule an outpatient stress test"),
-                ("C", "Give sublingual nitroglycerin only and discharge"),
-                ("D", "Order a transthoracic echocardiogram and observe"),
-                ("E", "Start heparin and wait 24 hours before intervention"),
-            ]
-            correct = "A"
-            explanation = (
-                "Inferior **STEMI** → give antiplatelet therapy and pursue **immediate reperfusion** (PCI if available within guideline window). "
-                "Stress testing is contraindicated in active ischemia; echo must not delay reperfusion."
-            )
-            rationales = {
-                "A": "Correct — time-sensitive reperfusion and aspirin in STEMI.",
-                "B": "Stress testing is for stable symptoms without resting pain or ST elevation.",
-                "C": "Discharging an acute STEMI after nitro is unsafe and delays reperfusion.",
-                "D": "Echo is useful but should not delay definitive reperfusion therapy.",
-                "E": "Anticoagulation may be used, but deferring PCI 24h in STEMI is inappropriate.",
-            }
-
-        # Cardiology – Workup (stable angina)
-        elif topic == "Cardiology" and qtype in ("Workup",):
-            stem = (
-                "A 58-year-old woman has exertional substernal chest pressure for 3 months, reliably provoked by brisk walking. "
-                "Resting ECG is normal. What is the best initial diagnostic test?"
-            )
-            bank = [
-                ("A", "Exercise treadmill ECG stress test"),
-                ("B", "CT coronary angiography immediately"),
-                ("C", "Cardiac MRI with gadolinium"),
-                ("D", "Troponin I now and in 3 hours"),
-                ("E", "BNP level"),
-            ]
-            correct = "A"
-            explanation = (
-                "Typical **stable angina** with interpretable resting ECG and ability to exercise → **exercise treadmill ECG** is the initial test."
-            )
-            rationales = {
-                "A": "Correct — first-line for stable angina with interpretable ECG.",
-                "B": "CTCA is not first-line in classic stable angina.",
-                "C": "CMR is not the best initial test for stable ischemia evaluation.",
-                "D": "Troponin is for suspected ACS, not chronic stable symptoms.",
-                "E": "BNP evaluates heart failure, not ischemia in this context.",
-            }
-
-        # Pulmonology – PE workup
-        elif topic == "Pulmonology" and qtype in ("Workup", "Management"):
-            stem = (
-                "A 48-year-old postoperative patient develops sudden pleuritic chest pain and dyspnea. HR 112, RR 24, SpO2 94% on room air. Hemodynamically stable. "
-                "What is the most appropriate next diagnostic test?"
-            )
-            bank = [("A", "D-dimer"), ("B", "CT pulmonary angiography"), ("C", "Ventilation–perfusion scan"), ("D", "Transthoracic echocardiography"), ("E", "Serial troponins")]
-            correct = "B"
-            explanation = (
-                "Moderate/high suspicion for **PE** in a **stable** patient → **CT pulmonary angiography** is the test of choice. "
-                "D-dimer is for **low** suspicion; V/Q is for contrast contraindication or severe renal disease."
-            )
-            rationales = {
-                "A": "D-dimer rules out PE when suspicion is low; not appropriate here.",
-                "B": "Correct — first-line diagnostic test for stable patients without contraindications.",
-                "C": "V/Q is alternative when CTPA cannot be used.",
-                "D": "Echo assesses right-heart strain; it does not confirm PE in a stable patient.",
-                "E": "Troponins assess myocardial injury, not primary PE workup.",
-            }
-
-        # Endocrine – DKA initial step
-        elif topic == "Endocrinology" and qtype in ("Management",):
-            stem = (
-                "A 24-year-old with type 1 diabetes presents with abdominal pain, Kussmaul respirations, and glucose 520 mg/dL. "
-                "Which is the most appropriate **initial** management step?"
-            )
-            bank = [("A", "IV insulin bolus"), ("B", "IV isotonic saline"), ("C", "IV sodium bicarbonate"), ("D", "Subcutaneous insulin"), ("E", "Broad-spectrum antibiotics")]
-            correct = "B"
-            explanation = (
-                "In **DKA**, prioritize **aggressive isotonic fluids first** to restore perfusion; then start **IV insulin** with potassium management."
-            )
-            rationales = {
-                "A": "Insulin is essential but comes after initial fluid resuscitation.",
-                "B": "Correct — fluids first.",
-                "C": "Bicarbonate rarely indicated; may worsen outcomes if used indiscriminately.",
-                "D": "SubQ insulin absorption is unreliable in DKA.",
-                "E": "Treat infection if present, but not the initial step here.",
-            }
-
-        # Fallback
-        else:
-            dx_or_mgmt = rnd_choice(["diagnosis", "management", "workup"])
-            stem = f"A clinical vignette in {topic} requiring {dx_or_mgmt} is presented. Choose the best option."
-            bank = [("A", "Option 1"), ("B", "Option 2"), ("C", "Option 3"), ("D", "Option 4"), ("E", "Option 5")]
-            correct = "A"
-            explanation = "NBME-like de-novo item. Focus on clinical reasoning with guideline-consistent choices."
-            rationales = {ltr: ("Correct." if ltr=="A" else "Less appropriate than the best answer given the vignette cues.") for ltr,_ in bank}
-
-        shuffle(bank)
-        # Keep rationales aligned to current letters
-        new_rats = {ltr: rationales.get(ltr, "Less appropriate than the best answer.") for ltr, _ in bank}
-        return stem, bank, correct, explanation, new_rats
-
-    # --- One-question-at-a-time state ---
+    # Initialize state
     if "qb_current" not in st.session_state:
         st.session_state.qb_current = None
         st.session_state.qb_answer = None
 
-    # Generate if none exists
+    # Generate question if none
     if st.session_state.qb_current is None:
-        topic = pick_topic(qb_topic_choice)
-        stem, choices, correct, expl, rats = generate_nbme_style_question(topic)
-        st.session_state.qb_current = {
-            "topic": topic,
-            "stem": stem,
-            "choices": choices,  # list of (letter, text)
-            "correct": correct,
-            "explanation": expl,
-            "rationales": rats,
-        }
+        tpl = pick_template(qb_topic_choice)
+        st.session_state.qb_current = assemble_question_from_template(tpl)
         st.session_state.qb_answer = None
 
     cur = st.session_state.qb_current
 
-    st.subheader(f"Topic: {cur['topic']}")
+    st.subheader(f"Topic: {cur['topic']}  ·  Type: {cur['qtype']}")
     st.write(cur["stem"])
-    # Show answer choices clearly
     for letter, text_opt in cur["choices"]:
         st.markdown(f"- **{letter}.** {text_opt}")
 
@@ -375,11 +467,11 @@ elif page == "Practice QBank (AI)":
     with c1:
         if st.button("Check Answer", use_container_width=True):
             st.session_state.qb_answer = sel
-            is_correct = (sel == cur["correct"]) if cur["correct"] in [ltr for ltr, _ in cur["choices"]] else False
+            is_correct = (sel == cur["correct"])
             if is_correct:
-                st.success(f"Correct! {sel}")
+                st.success(f"✅ Correct! {sel}")
             else:
-                st.error(f"Incorrect. Correct answer: {cur['correct']}")
+                st.error(f"❌ Incorrect. Correct answer: {cur['correct']}")
             st.markdown("**Explanation**")
             st.info(cur["explanation"])
             st.markdown("**Why the other options are wrong**")
@@ -388,7 +480,7 @@ elif page == "Practice QBank (AI)":
                     continue
                 st.write(f"**{ltr}.** {cur['rationales'].get(ltr, 'Less appropriate than the best answer.')}")
 
-            # Auto-log to DB as AI_QBANK  ✅ fixed newlines
+            # Log to DB as AI_QBANK (with proper newlines)
             with engine.begin() as conn:
                 conn.execute(text("""
                     INSERT INTO questions (raw_question, user_answer, correct_answer, explanation, qtype, topic_primary, topic_secondary, mistake_reason, source)
@@ -398,7 +490,7 @@ elif page == "Practice QBank (AI)":
                     "user_answer": sel,
                     "correct_answer": cur["correct"],
                     "explanation": cur["explanation"],
-                    "qtype": "Mixed",  # randomized types like exam
+                    "qtype": cur["qtype"],
                     "topic_primary": cur["topic"],
                     "topic_secondary": None,
                     "mistake_reason": "",
@@ -408,21 +500,11 @@ elif page == "Practice QBank (AI)":
 
     with c2:
         if st.button("Another Question", use_container_width=True):
-            topic = pick_topic(qb_topic_choice)
-            stem, choices, correct, expl, rats = generate_nbme_style_question(topic)
-            st.session_state.qb_current = {
-                "topic": topic,
-                "stem": stem,
-                "choices": choices,
-                "correct": correct,
-                "explanation": expl,
-                "rationales": rats,
-            }
+            tpl = pick_template(qb_topic_choice)
+            st.session_state.qb_current = assemble_question_from_template(tpl)
             st.session_state.qb_answer = None
 
-# ---------------------------
-# Page: Dashboard
-# ---------------------------
+# --------- Dashboard ---------
 elif page == "Dashboard":
     st.header("📊 Dashboard")
     with engine.begin() as conn:
@@ -431,13 +513,11 @@ elif page == "Dashboard":
     if df.empty:
         st.info("No questions logged yet.")
     else:
-        # Compute correctness dynamically
         df["is_correct"] = (
             df["user_answer"].fillna("").str.strip().str.upper()
             == df["correct_answer"].fillna("").str.strip().str.upper()
         )
 
-        # --- Filters ---
         colf1, colf2, colf3 = st.columns([1,1,2])
         with colf1:
             source_opt = st.selectbox("Source", ["(all)", "USER_PASTED", "AI_QBANK"])
@@ -456,7 +536,6 @@ elif page == "Dashboard":
 
         fdf = df.loc[mask].copy()
 
-        # Overview
         st.subheader("Overview")
         cA, cB, cC = st.columns(3)
         with cA:
@@ -477,7 +556,6 @@ elif page == "Dashboard":
         st.subheader("Detailed Table")
         st.dataframe(fdf, use_container_width=True)
 
-        # Download CSV of filtered view
         csv = fdf.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="⬇️ Download filtered CSV",
