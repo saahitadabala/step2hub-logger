@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 import os
-from io import StringIO
+import datetime
 from sqlalchemy import create_engine, text
 
 # ---------------------------
@@ -46,14 +46,14 @@ def init_db():
 
 # Seed keywords for classification
 TOPIC_SEEDS = {
-    "Cardiology": ["chest pain", "murmur", "MI", "ST elevation", "troponin", "AFib", "hypertension"],
-    "Pulmonology": ["dyspnea", "wheezing", "asthma", "COPD", "pneumonia", "hypoxemia"],
-    "Gastroenterology": ["abdominal pain", "diarrhea", "constipation", "IBS", "bloating", "rectal bleeding"],
-    "Nephrology": ["AKI", "CKD", "proteinuria", "hematuria", "casts", "dialysis", "oliguria", "anuria", "edema"],
-    "ObGyn": ["pregnant", "gestation", "LMP", "miscarriage", "postpartum", "contraception"],
+    "Cardiology": ["chest pain", "murmur", "mi", "st elevation", "troponin", "afib", "hypertension"],
+    "Pulmonology": ["dyspnea", "wheezing", "asthma", "copd", "pneumonia", "hypoxemia"],
+    "Gastroenterology": ["abdominal pain", "diarrhea", "constipation", "ibs", "bloating", "rectal bleeding"],
+    "Nephrology": ["aki", "ckd", "proteinuria", "hematuria", "casts", "dialysis", "oliguria", "anuria", "edema"],
+    "ObGyn": ["pregnant", "gestation", "lmp", "miscarriage", "postpartum", "contraception"],
     "Endocrinology": ["diabetes", "thyroid", "cortisol", "adrenal", "pituitary"],
-    "Psychiatry": ["anxiety", "depression", "psychosis", "bipolar", "PTSD", "substance"],
-    "Neurology": ["seizure", "stroke", "weakness", "MS", "Parkinson", "neuropathy"],
+    "Psychiatry": ["anxiety", "depression", "psychosis", "bipolar", "ptsd", "substance"],
+    "Neurology": ["seizure", "stroke", "weakness", "ms", "parkinson", "neuropathy"],
     "Dermatology": ["rash", "lesion", "eczema", "psoriasis", "melanoma"],
     "HemeOnc": ["anemia", "lymphoma", "leukemia", "thrombocytopenia", "bleeding"],
 }
@@ -76,7 +76,7 @@ def classify_topics(text_block: str):
 
     for topic, seeds in TOPIC_SEEDS.items():
         for seed in seeds:
-            if seed.lower() in text_lower:
+            if seed in text_lower:
                 # Nephrology gating: only count if strong kidney context
                 if topic == "Nephrology":
                     if re.search(r"(proteinuria|hematuria|casts|aki|ckd|oliguria|anuria|dialysis|edema)", text_lower):
@@ -103,7 +103,7 @@ def guess_question_type(text_block: str):
 # ---------------------------
 
 st.title("🧠 Step2Hub — Logger")
-st.caption("Log NBME-style questions with AI-assisted classification + your own AI QBank tab")
+st.caption("Log NBME-style questions with AI-assisted classification + your own AI QBank")
 
 init_db()
 
@@ -176,7 +176,7 @@ elif page == "Practice QBank (AI)":
             st.session_state.pop("qb_answer", None)
 
     # Utility to pick a topic when (Random) is selected
-    from random import choice as rnd_choice, shuffle
+    from random import choice as rnd_choice, shuffle, choice
 
     def pick_topic(topic_choice: str) -> str:
         return rnd_choice(list(TOPIC_SEEDS.keys())) if topic_choice == "(Random)" else topic_choice
@@ -184,15 +184,14 @@ elif page == "Practice QBank (AI)":
     # --- NBME-style de-novo question generator ---
     # Returns: stem (str), choices (list[(letter,text)]), correct_letter (str), explanation (str), rationales (dict letter->why wrong/right)
     def generate_nbme_style_question(topic: str):
-        import random
-        qtype = random.choice(["Diagnosis", "Management", "Workup", "Mechanism"])  # random like the real exam
+        qtype = choice(["Diagnosis", "Management", "Workup", "Mechanism"])  # random like the real exam
         stem = ""
         bank = []
         correct = None
         explanation = ""
         rationales = {}
 
-        # Handcrafted high-yield items (thorough explanations + distractor rationales)
+        # Handcrafted high-yield items (concise, thorough explanations + distractor rationales)
         if topic == "Gastroenterology" and qtype in ("Management", "Diagnosis"):
             stem = (
                 "A 28-year-old woman has 8 months of intermittent crampy lower abdominal pain with 3–4 loose stools/day. "
@@ -271,8 +270,7 @@ elif page == "Practice QBank (AI)":
             }
         else:
             # Generic fallback (kept de-novo and NBME-like)
-            import random
-            dx_or_mgmt = random.choice(["diagnosis", "management", "workup", "mechanism"])
+            dx_or_mgmt = choice(["diagnosis", "management", "workup", "mechanism"])
             stem = (f"A clinical vignette in {topic} requiring {dx_or_mgmt} is presented. Choose the best option.")
             bank = [("A", "Option 1"), ("B", "Option 2"), ("C", "Option 3"), ("D", "Option 4"), ("E", "Option 5")]
             correct = "A"
@@ -332,7 +330,7 @@ elif page == "Practice QBank (AI)":
                     continue
                 st.write(f"**{ltr}.** {cur['rationales'].get(ltr, 'Less appropriate than the best answer.')}")
 
-            # Auto-log to DB as AI_QBANK (FIXED newlines)
+            # Auto-log to DB as AI_QBANK  ✅ fixed newlines
             with engine.begin() as conn:
                 conn.execute(text("""
                     INSERT INTO questions (raw_question, user_answer, correct_answer, explanation, qtype, topic_primary, topic_secondary, mistake_reason, source)
@@ -377,8 +375,10 @@ elif page == "Dashboard":
         st.info("No questions logged yet.")
     else:
         # Compute correctness dynamically (safe if blanks)
-        df["is_correct"] = (df["user_answer"].fillna("").str.strip().str.upper()
-                            == df["correct_answer"].fillna("").str.strip().str.upper())
+        df["is_correct"] = (
+            df["user_answer"].fillna("").str.strip().str.upper()
+            == df["correct_answer"].fillna("").str.strip().str.upper()
+        )
 
         # --- Filters ---
         colf1, colf2, colf3 = st.columns([1,1,2])
